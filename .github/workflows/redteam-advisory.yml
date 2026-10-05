@@ -35,6 +35,16 @@ jobs:
       - name: Record source and runtime environment
         run: |
           mkdir -p redteam-artifacts
+          if [ "$BASE_SHA" = '0000000000000000000000000000000000000000' ]; then
+            BASE_SHA=$(git merge-base "$HEAD_SHA" origin/main)
+            echo "BASE_SHA=$BASE_SHA" >> "$GITHUB_ENV"
+            echo 'created branch: merge-base with origin/main' > redteam-artifacts/base-source.txt
+          fi
+          python3 - "$BASE_SHA" "$HEAD_SHA" <<'PY'
+          import re
+          import sys
+          assert all(re.fullmatch('[0-9a-f]{40}', sha) for sha in sys.argv[1:]), 'full SHA required'
+          PY
           git cat-file -e "$BASE_SHA^{commit}"
           test "$(git rev-parse HEAD)" = "$HEAD_SHA"
           echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$HEAD_SHA")" >> "$GITHUB_ENV"
@@ -69,6 +79,11 @@ jobs:
           first = _load_verdict(str(root / 'verdict.json'))
           expected = {'baseSha': os.environ['BASE_SHA'], 'headSha': os.environ['HEAD_SHA']}
           assert first['pr'] == expected, 'incorrect reviewed range'
+          expected_outcome = 'failure' if first['verdict'] == 'block' else 'success'
+          assert os.environ['ADAPTER_OUTCOME'] == expected_outcome, 'adapter outcome contradicts verdict'
+          assert not first['routing']['selfMergeEligible'], 'advisory cannot authorize merging'
+          if first['counters']['protectedPathHits']:
+              assert first['routing']['maintainerReviewRequired'], 'protected change requires owner review'
           start = time.perf_counter()
           subprocess.run(['pr_redteam', 'run', '--repo', '.', '--base', expected['baseSha'],
                           '--head', expected['headSha'], '--out', str(root / 'verdict-repeat.json')], check=True)
@@ -151,14 +166,16 @@ jobs:
               suites.append({**suite.attrib, 'failedCases': [case.attrib['name']
                   for case in suite.findall('testcase') if case.find('failure') is not None]})
           tests = sum(int(s['tests']) for s in suites)
-          failures = sum(int(s['failures']) + int(s['errors']) for s in suites)
+          failures = sum(int(s['failures']) for s in suites)
+          errors = sum(int(s['errors']) for s in suites)
           skipped = sum(int(s['skipped']) for s in suites)
           score = {'headSha': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
-                   'tests': tests, 'failures': failures, 'skipped': skipped,
-                   'passed': tests - failures - skipped, 'executed': tests - skipped, 'suites': suites,
+                   'tests': tests, 'failures': failures, 'errors': errors, 'skipped': skipped,
+                   'passed': tests - failures - errors - skipped, 'executed': tests - skipped, 'suites': suites,
                    'outcome': os.environ['TEST_OUTCOME'], 'raceFreedomProven': False}
           Path('native-artifacts/score.json').write_text(json.dumps(score, indent=2, sort_keys=True) + '\n')
-          assert tests > 0 and failures == 0 and os.environ['TEST_OUTCOME'] == 'success', score
+          assert tests - skipped > 0 and failures == 0 and errors == 0 and \
+              os.environ['TEST_OUTCOME'] == 'success', score
           PY
       - name: Run module quality checks
         if: '!cancelled()'
