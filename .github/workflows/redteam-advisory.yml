@@ -25,6 +25,7 @@ jobs:
       PYTHONHASHSEED: '0'
       TZ: UTC
       LC_ALL: C
+      DISTRIBUTION_ALLOWED: ${{ github.actor == github.repository_owner && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     steps:
       - name: Checkout reviewed head
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -49,10 +50,44 @@ jobs:
           test "$(git rev-parse HEAD)" = "$HEAD_SHA"
           echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$HEAD_SHA")" >> "$GITHUB_ENV"
           date +%s.%N > redteam-artifacts/action-start.txt
+      - name: Check optional doctrine access
+        id: distribution
+        env:
+          REDTEAM_DOCTRINE_TOKEN: ${{ secrets.REDTEAM_DOCTRINE_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          authorized = os.environ['DISTRIBUTION_ALLOWED'] == 'true'
+          credential = bool(os.environ.get('REDTEAM_DOCTRINE_TOKEN'))
+          enabled = authorized and credential
+          record = {'repository': 'tuannx/redteam-doctrine',
+                    'toolSha': '0ee5a2e48f16c5e3274fceb1f6c390a10aaaedb2',
+                    'ownerControlledEvent': authorized, 'credentialPresent': credential,
+                    'gate': 'notRun', 'scores': None,
+                    'nextAction': 'Owner can configure REDTEAM_DOCTRINE_TOKEN with read-only repository access '
+                                  'or choose a public approved distribution.'}
+          Path('redteam-artifacts/distribution.json').write_text(json.dumps(record, indent=2) + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('enabled=' + str(enabled).lower() + '\n')
+          PY
+      - name: Checkout pinned doctrine source
+        id: source
+        if: steps.distribution.outputs.enabled == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: tuannx/redteam-doctrine
+          ref: 0ee5a2e48f16c5e3274fceb1f6c390a10aaaedb2
+          token: ${{ secrets.REDTEAM_DOCTRINE_TOKEN }}
+          path: .redteam-doctrine-runtime
+          persist-credentials: false
       - name: Run pinned advisory adapter
         id: gate
+        if: steps.distribution.outputs.enabled == 'true'
         continue-on-error: true
-        uses: tuannx/redteam-doctrine@0ee5a2e48f16c5e3274fceb1f6c390a10aaaedb2
+        uses: ./.redteam-doctrine-runtime
         with:
           base: ${{ env.BASE_SHA }}
           head: ${{ env.HEAD_SHA }}
@@ -60,7 +95,7 @@ jobs:
           comment: 'false'
           python-version: '3.12.11'
       - name: Verify range and measure repeatability
-        if: '!cancelled()'
+        if: ${{ !cancelled() && steps.distribution.outputs.enabled == 'true' }}
         env:
           ADAPTER_OUTCOME: ${{ steps.gate.outcome }}
         run: |
@@ -78,6 +113,9 @@ jobs:
           from pr_redteam.core import hash_normalized_verdict
 
           root = Path('redteam-artifacts')
+          tool_sha = subprocess.check_output(['git', '-C', '.redteam-doctrine-runtime',
+                                               'rev-parse', 'HEAD'], text=True).strip()
+          assert tool_sha == '0ee5a2e48f16c5e3274fceb1f6c390a10aaaedb2', 'incorrect tool revision'
           first = _load_verdict(str(root / 'verdict.json'))
           expected = {'baseSha': os.environ['BASE_SHA'], 'headSha': os.environ['HEAD_SHA']}
           assert first['pr'] == expected, 'incorrect reviewed range'
@@ -115,9 +153,20 @@ jobs:
                          'redGreenTestTruth', 'mutationTesting', 'claimMatching', 'architectureAnalysis'],
           }
           (root / 'score.json').write_text(json.dumps(score, indent=2, sort_keys=True) + '\n')
+          distribution = json.loads((root / 'distribution.json').read_text())
+          distribution.update({'gate': 'measured', 'scores': {
+              'schemaValid': score['schemaValid'], 'shaBinding': score['shaBinding'],
+              'repeatability': score['repeatability']}})
+          (root / 'distribution.json').write_text(json.dumps(distribution, indent=2) + '\n')
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
               summary.write('Advisory artifact: schema 2/2; SHA binding 2/2; equal hashes 1/1.\n\n')
               summary.write('Java correctness is not scored by this tool. Native tests are a separate job.\n')
+      - name: Report unavailable doctrine access
+        if: ${{ !cancelled() && steps.distribution.outputs.enabled != 'true' }}
+        run: |
+          echo 'Advisory gate notRun: owner-controlled access to the private doctrine source is unavailable.'
+          echo 'See distribution.json; configure the optional read-only secret or choose an approved distribution.'
+          exit 1
           PY
       - name: Upload advisory measurements
         if: '!cancelled()'
