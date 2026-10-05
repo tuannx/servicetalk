@@ -1,0 +1,175 @@
+name: Fork Redteam Advisory
+permissions:
+  contents: read
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main, 'codex/**' ]
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Base commit SHA
+        required: true
+      head:
+        description: Head commit SHA
+        required: true
+jobs:
+  advisory:
+    if: github.repository == 'tuannx/servicetalk'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha || inputs.base || github.event.before }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha || inputs.head || github.sha }}
+      PYTHONHASHSEED: '0'
+      TZ: UTC
+      LC_ALL: C
+    steps:
+      - name: Checkout reviewed head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.HEAD_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Record source and runtime environment
+        run: |
+          mkdir -p redteam-artifacts
+          git cat-file -e "$BASE_SHA^{commit}"
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$HEAD_SHA")" >> "$GITHUB_ENV"
+          date +%s.%N > redteam-artifacts/action-start.txt
+      - name: Run pinned advisory adapter
+        id: gate
+        continue-on-error: true
+        uses: tuannx/redteam-doctrine@0ee5a2e48f16c5e3274fceb1f6c390a10aaaedb2
+        with:
+          base: ${{ env.BASE_SHA }}
+          head: ${{ env.HEAD_SHA }}
+          verdict-path: redteam-artifacts/verdict.json
+          comment: 'false'
+          python-version: '3.12.11'
+      - name: Verify range and measure repeatability
+        if: '!cancelled()'
+        env:
+          ADAPTER_OUTCOME: ${{ steps.gate.outcome }}
+        run: |
+          date +%s.%N > redteam-artifacts/action-end.txt
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          import time
+          from pathlib import Path
+          from pr_redteam.cli import _load_verdict
+          from pr_redteam.core import hash_normalized_verdict
+
+          root = Path('redteam-artifacts')
+          first = _load_verdict(str(root / 'verdict.json'))
+          expected = {'baseSha': os.environ['BASE_SHA'], 'headSha': os.environ['HEAD_SHA']}
+          assert first['pr'] == expected, 'incorrect reviewed range'
+          start = time.perf_counter()
+          subprocess.run(['pr_redteam', 'run', '--repo', '.', '--base', expected['baseSha'],
+                          '--head', expected['headSha'], '--out', str(root / 'verdict-repeat.json')], check=True)
+          repeat_seconds = time.perf_counter() - start
+          second = _load_verdict(str(root / 'verdict-repeat.json'))
+          assert second['pr'] == expected, 'incorrect repeated range'
+          first_hash, second_hash = map(hash_normalized_verdict, (first, second))
+          assert first_hash == second_hash, 'non-deterministic verdict'
+          versions = subprocess.check_output(['python3', '-m', 'pip', 'freeze'], text=True)
+          (root / 'versions.txt').write_text(versions)
+          subprocess.run(['pr_redteam', 'render', '--verdict', str(root / 'verdict.json')],
+                         check=True, stdout=(root / 'rendered-verdict.md').open('w'))
+          score = {
+              'scope': 'advisory', 'doctrineMainSha': '61af48cd14c7b51b4220e5574500d0cffb8fd249',
+              'toolSha': '0ee5a2e48f16c5e3274fceb1f6c390a10aaaedb2', 'pr': expected,
+              'schemaValid': {'passed': 2, 'total': 2}, 'shaBinding': {'passed': 2, 'total': 2},
+              'repeatability': {'equalPairs': 1, 'totalPairs': 1, 'hash': first_hash},
+              'artifactSha256': hashlib.sha256((root / 'verdict.json').read_bytes()).hexdigest(),
+              'actionElapsedSeconds': float((root / 'action-end.txt').read_text()) -
+                                      float((root / 'action-start.txt').read_text()),
+              'repeatElapsedSeconds': repeat_seconds, 'adapterOutcome': os.environ['ADAPTER_OUTCOME'],
+              'verdict': first['verdict'], 'counters': first['counters'], 'checks': first['checks'],
+              'routing': first['routing'], 'actor': first['actor'],
+              'hostedRunId': os.environ['GITHUB_RUN_ID'], 'javaCorrectnessScore': None,
+              'notRun': ['signedPolicyVerification', 'runAttestation', 'JavaStaticChecker',
+                         'redGreenTestTruth', 'mutationTesting', 'claimMatching', 'architectureAnalysis'],
+          }
+          (root / 'score.json').write_text(json.dumps(score, indent=2, sort_keys=True) + '\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('Advisory artifact: schema 2/2; SHA binding 2/2; equal hashes 1/1.\n\n')
+              summary.write('Java correctness is not scored by this tool. Native tests are a separate job.\n')
+          PY
+      - name: Upload advisory measurements
+        if: '!cancelled()'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: redteam-advisory-${{ github.run_id }}-${{ github.run_attempt }}
+          path: redteam-artifacts/
+  native:
+    if: github.repository == 'tuannx/servicetalk'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout reviewed head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || inputs.head || github.sha }}
+          persist-credentials: false
+      - name: Set up JDK 17
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          java-version: '17'
+          distribution: zulu
+          cache: gradle
+      - name: Run focused native tests
+        id: tests
+        continue-on-error: true
+        run: |
+          mkdir -p native-artifacts
+          java -version > native-artifacts/java-version.txt 2>&1
+          /usr/bin/time -p ./gradlew :servicetalk-concurrent-api:test --no-daemon --max-workers=2 \
+            --tests io.servicetalk.concurrent.api.SequentialSubscriptionTest \
+            --tests io.servicetalk.concurrent.api.PublisherBufferConcurrencyTest \
+            > native-artifacts/tests.log 2> native-artifacts/test-runtime.txt
+      - name: Score native test results
+        if: '!cancelled()'
+        env:
+          TEST_OUTCOME: ${{ steps.tests.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          suites = []
+          for file in sorted(Path('servicetalk-concurrent-api/build/test-results/test').glob('TEST-*.xml')):
+              suite = ET.parse(file).getroot()
+              suites.append({**suite.attrib, 'failedCases': [case.attrib['name']
+                  for case in suite.findall('testcase') if case.find('failure') is not None]})
+          tests = sum(int(s['tests']) for s in suites)
+          failures = sum(int(s['failures']) + int(s['errors']) for s in suites)
+          skipped = sum(int(s['skipped']) for s in suites)
+          score = {'headSha': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+                   'tests': tests, 'failures': failures, 'skipped': skipped,
+                   'passed': tests - failures - skipped, 'executed': tests - skipped, 'suites': suites,
+                   'outcome': os.environ['TEST_OUTCOME'], 'raceFreedomProven': False}
+          Path('native-artifacts/score.json').write_text(json.dumps(score, indent=2, sort_keys=True) + '\n')
+          assert tests > 0 and failures == 0 and os.environ['TEST_OUTCOME'] == 'success', score
+          PY
+      - name: Run module quality checks
+        if: '!cancelled()'
+        run: |
+          /usr/bin/time -p ./gradlew :servicetalk-concurrent-api:quality --no-daemon --max-workers=2 \
+            > native-artifacts/quality.log 2> native-artifacts/quality-runtime.txt
+      - name: Upload native measurements
+        if: '!cancelled()'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-concurrent-api-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            native-artifacts/
+            servicetalk-concurrent-api/build/test-results/test/TEST-*.xml
