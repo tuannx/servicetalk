@@ -67,9 +67,11 @@ jobs:
           date +%s.%N > redteam-artifacts/action-end.txt
           python3 - <<'PY'
           import hashlib
+          import importlib.metadata
           import json
           import os
           import subprocess
+          import sys
           import time
           from pathlib import Path
           from pr_redteam.cli import _load_verdict
@@ -92,8 +94,9 @@ jobs:
           assert second['pr'] == expected, 'incorrect repeated range'
           first_hash, second_hash = map(hash_normalized_verdict, (first, second))
           assert first_hash == second_hash, 'non-deterministic verdict'
-          versions = subprocess.check_output(['python3', '-m', 'pip', 'freeze'], text=True)
-          (root / 'versions.txt').write_text(versions)
+          versions = {'python': sys.version, 'packages': dict(sorted(
+              (package.metadata['Name'], package.version) for package in importlib.metadata.distributions()))}
+          (root / 'versions.json').write_text(json.dumps(versions, indent=2, sort_keys=True) + '\n')
           subprocess.run(['pr_redteam', 'render', '--verdict', str(root / 'verdict.json')],
                          check=True, stdout=(root / 'rendered-verdict.md').open('w'))
           score = {
