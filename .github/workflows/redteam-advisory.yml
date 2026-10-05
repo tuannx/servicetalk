@@ -83,6 +83,11 @@ jobs:
           token: ${{ secrets.REDTEAM_DOCTRINE_TOKEN }}
           path: .redteam-doctrine-runtime
           persist-credentials: false
+      - name: Verify pinned doctrine source before execution
+        if: steps.distribution.outputs.enabled == 'true'
+        run: |
+          test "$(git -C .redteam-doctrine-runtime rev-parse HEAD)" = \
+            '0ee5a2e48f16c5e3274fceb1f6c390a10aaaedb2'
       - name: Run pinned advisory adapter
         id: gate
         if: steps.distribution.outputs.enabled == 'true'
@@ -161,13 +166,13 @@ jobs:
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
               summary.write('Advisory artifact: schema 2/2; SHA binding 2/2; equal hashes 1/1.\n\n')
               summary.write('Java correctness is not scored by this tool. Native tests are a separate job.\n')
+          PY
       - name: Report unavailable doctrine access
         if: ${{ !cancelled() && steps.distribution.outputs.enabled != 'true' }}
         run: |
           echo 'Advisory gate notRun: owner-controlled access to the private doctrine source is unavailable.'
           echo 'See distribution.json; configure the optional read-only secret or choose an approved distribution.'
           exit 1
-          PY
       - name: Upload advisory measurements
         if: '!cancelled()'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
