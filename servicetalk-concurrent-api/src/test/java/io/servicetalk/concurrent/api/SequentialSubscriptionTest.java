@@ -257,7 +257,7 @@ final class SequentialSubscriptionTest {
             public void request(long n) {
                 switchInProgress.countDown();
                 try {
-                    releaseSwitch.await();
+                    releaseSwitch.await(DEFAULT_TIMEOUT_SECONDS, SECONDS);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
