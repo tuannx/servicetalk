@@ -28,6 +28,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
@@ -58,6 +59,8 @@ import static org.mockito.Mockito.verifyNoMoreInteractions;
 
 final class SequentialSubscriptionTest {
     private static final int ITERATIONS_FOR_CONCURRENT_TESTS = 500;
+    private static final int ITERATIONS_FOR_RACE_TESTS = 20_000;
+    private static final int EMIT_BATCH = 10;
     private SequentialSubscription s;
     private Subscription s1;
     private Subscription s2;
@@ -237,6 +240,78 @@ final class SequentialSubscriptionTest {
         }
     }
 
+    @Test
+    void switchToOverlappingInProgressSwitchDeliversOutstandingDemandToNewSubscription() throws Exception {
+        final SequentialSubscription subscription = new SequentialSubscription();
+        final CountingSubscription first = new CountingSubscription();
+        subscription.switchTo(first);
+        subscription.request(EMIT_BATCH);
+
+        // Park the switching thread inside request(n) so the switch is provably still in progress (the
+        // sourceRequested state is SWITCHING) before the overlapping switchTo is invoked. The latches dilate the
+        // race window deterministically instead of relying on timing or sleeps.
+        final CountDownLatch switchInProgress = new CountDownLatch(1);
+        final CountDownLatch releaseSwitch = new CountDownLatch(1);
+        final Subscription parking = new Subscription() {
+            @Override
+            public void request(long n) {
+                switchInProgress.countDown();
+                try {
+                    releaseSwitch.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+
+            @Override
+            public void cancel() {
+            }
+        };
+        Future<Void> switching = executor.submit(() -> {
+            subscription.switchTo(parking);
+            return null;
+        });
+        assertThat("The first switch did not reach request(n) on the new subscription",
+                switchInProgress.await(DEFAULT_TIMEOUT_SECONDS, SECONDS), is(true));
+
+        final CountingSubscription resubscribed = new CountingSubscription();
+        subscription.switchTo(resubscribed); // overlaps the switch that is still unwinding above
+        releaseSwitch.countDown();
+        switching.get();
+
+        assertThat("Outstanding demand must be delivered to the newest subscription",
+                resubscribed.requestedReceived(), is((long) EMIT_BATCH));
+    }
+
+    @Test
+    void switchToWhileAnotherSwitchUnwindsRequestsOutstandingDemandFromNewSubscription() throws Exception {
+        for (int i = 0; i < ITERATIONS_FOR_RACE_TESTS; ++i) {
+            switchToWhileAnotherSwitchUnwinds();
+        }
+    }
+
+    private void switchToWhileAnotherSwitchUnwinds() throws Exception {
+        final SequentialSubscription subscription = new SequentialSubscription();
+        subscription.switchTo(new CountingSubscription());
+        // The previous source terminated while EMIT_BATCH was outstanding.
+        subscription.request(EMIT_BATCH);
+        // The new source emits all of its items synchronously from request(n), and the downstream asks for more from
+        // inside onNext. When the source terminates, the redo operator subscribes again from another thread (e.g. when
+        // a timer fires) while switchTo(source) is still unwinding on this thread. The termination latch fires the
+        // resubscribe at that exact moment instead of spinning on a volatile flag.
+        final EmittingSubscription source = new EmittingSubscription(subscription, 2 * EMIT_BATCH, EMIT_BATCH);
+        final CountingSubscription resubscribed = new CountingSubscription();
+        final Future<Void> resubscribe = executor.submit(() -> {
+            source.awaitTerminated();
+            subscription.switchTo(resubscribed);
+            return null;
+        });
+        subscription.switchTo(source);
+        resubscribe.get();
+        assertThat("Demand that is outstanding after the last switch must be requested from the new subscription",
+                resubscribed.requestedReceived(), is((long) EMIT_BATCH));
+    }
+
     private void testConcurrentRequestEmitAndSwitch(int totalItems, int maxDeliveryPerSubscription) throws Exception {
         final SequentialSubscription subscription = new SequentialSubscription();
         final CyclicBarrier allStarted = new CyclicBarrier(3);
@@ -375,6 +450,58 @@ final class SequentialSubscriptionTest {
         @Override
         public String toString() {
             return "requestedReceived: " + requestedReceived.get() + " cancelled: " + cancelled;
+        }
+    }
+
+    /**
+     * Emits items synchronously from {@link #request(long)} like a {@link Publisher#range(int, int)} does.
+     */
+    private static final class EmittingSubscription implements Subscription {
+        private final SequentialSubscription subscription;
+        private final int totalItems;
+        private final int requestMoreEvery;
+        private final CountDownLatch terminatedLatch = new CountDownLatch(1);
+        private long demand;
+        private int emitted;
+        private boolean emitting;
+
+        EmittingSubscription(final SequentialSubscription subscription, final int totalItems,
+                             final int requestMoreEvery) {
+            this.subscription = subscription;
+            this.totalItems = totalItems;
+            this.requestMoreEvery = requestMoreEvery;
+        }
+
+        @Override
+        public void request(final long n) {
+            demand += n;
+            if (emitting) {
+                return;
+            }
+            emitting = true;
+            try {
+                while (demand > 0 && emitted < totalItems) {
+                    --demand;
+                    ++emitted;
+                    subscription.itemReceived();
+                    if (emitted % requestMoreEvery == 0) {
+                        subscription.request(requestMoreEvery);
+                    }
+                }
+            } finally {
+                emitting = false;
+            }
+            if (emitted == totalItems) {
+                terminatedLatch.countDown();
+            }
+        }
+
+        @Override
+        public void cancel() {
+        }
+
+        void awaitTerminated() throws InterruptedException {
+            terminatedLatch.await();
         }
     }
 
