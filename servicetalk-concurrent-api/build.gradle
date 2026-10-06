@@ -54,7 +54,8 @@ if (project.hasProperty("jdiPoc")) {
   }
   sourceSets {
     jdiTest {
-      java.srcDirs = ["src/test/jdi"]
+      java.srcDirs = ["src/test/jdi",
+                      project(":servicetalk-concurrent-internal").file("src/testFixtures/jdi")]
       compileClasspath = sourceSets.test.compileClasspath + sourceSets.test.output
       runtimeClasspath = output + sourceSets.test.runtimeClasspath
     }

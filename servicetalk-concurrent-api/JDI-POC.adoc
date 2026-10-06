@@ -17,9 +17,9 @@ The regular `test` task still uses its existing Java compatibility and test sour
 The JDI source set and task exist only with `-PjdiPoc`; regular PR CI does not run these
 schedules automatically. With the flag, the module's quality tasks also check the JDI sources.
 
-== Two schedules, one invariant
+== Handoff schedules
 
-Both cases assert that the replacement receives the outstanding demand of `10`.
+For positive demand, each case asserts that the replacement receives exactly the outstanding demand.
 
 * `afterReentryCheck=false`: pause the old switch owner before it checks for reentry.
   Run the replacement switch to completion, then resume the owner. Expected: green, `10`.
@@ -27,9 +27,9 @@ Both cases assert that the replacement receives the outstanding demand of `10`.
   Verify the local `reentry` value is false. Run the replacement switch to completion,
   then resume the owner. Current base: red, `0` instead of `10`.
 
-The test does not accept the bug as a passing outcome. On the current base,
-`jdiTest` must fail exactly the second parameterized case. A third test deliberately
-selects a missing breakpoint and verifies that the harness fails and terminates the child.
+The test does not accept the bug as a passing outcome. The after-check schedules
+remain red on the current production code. A missing-breakpoint control verifies
+that the harness fails and terminates the child.
 
 == Boundaries
 
@@ -44,10 +44,38 @@ Executable locations are resolved from unique source anchors and checked against
 Source drift or missing debug information fails the test rather than silently skipping it.
 A production redesign will require reviewing these implementation-specific anchors.
 
-This proves two controlled schedules, not all interleavings or Java memory-model behaviors.
+This proves controlled schedules, not all interleavings or Java memory-model behaviors.
 Debugger suspension changes execution conditions. The subscriptions emit no items; this is
 a unit-level demand-handoff reproduction, not an end-to-end reproduction of issue #1672.
 
 JDI references:
 https://docs.oracle.com/en/java/javase/17/docs/api/jdk.jdi/com/sun/jdi/request/EventRequest.html[thread suspension policy],
 https://docs.oracle.com/en/java/javase/17/docs/api/jdk.jdi/com/sun/jdi/event/EventSet.html[event-set resume].
+
+== Shared fixture and coverage
+
+`JdiTestScenario` lives in `servicetalk-concurrent-internal/src/testFixtures/jdi`.
+The opt-in source set compiles that source directory; the ordinary Java 8 fixture
+artifact does not include JDI. Other modules can include the same source directory
+in an opt-in JDK 17 source set with their test runtime classpath.
+
+The fixture owns launch, stdout/stderr readers, event deadline and forced cleanup.
+A `Schedule` receives the session and JDI VM, installs breakpoints, retains/resumes
+its event sets, and verifies required milestones. Returning from a schedule alone
+is insufficient: the child must also exit successfully. Domain assertions remain
+in the child or calling test. Direct JDI access is trusted test code, not a sandbox.
+
+The demand matrix uses zero, one, ten and unbounded demand at both handoff anchors.
+Zero demand is followed by a request of one, so silently replacing the new
+subscription with the old subscription cannot pass through a zero-equals-zero
+assertion. Successful handoffs also check subsequent demand and cancellation.
+
+Lifecycle controls cover both output pipes, child assertion failure, schedule
+failure while suspended, interruption and missing production locations. The
+callback fixture additionally preserves actor failures alongside cancellation.
+
+These are enumerated schedules, not every possible race. Concurrent subscriber
+signals that violate the source contract, weak-memory reorderings, arbitrary
+third-party callbacks, and exhaustive scheduling of transport event loops remain
+outside this POC. Buffer/Replay/HTTP scenario tests use callback gates when those
+are sufficient; enabling JDI everywhere would not add causal evidence by itself.
