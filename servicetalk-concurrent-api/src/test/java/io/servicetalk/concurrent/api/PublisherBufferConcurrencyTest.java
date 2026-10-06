@@ -1,5 +1,5 @@
 /*
- * Copyright © 2020-2021 Apple Inc. and the ServiceTalk project authors
+ * Copyright © 2020-2026 Apple Inc. and the ServiceTalk project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,9 +23,10 @@ import io.servicetalk.context.api.ContextMap;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.function.UnaryOperator;
 import javax.annotation.Nullable;
@@ -39,7 +40,9 @@ import static java.time.Duration.ofMillis;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.function.UnaryOperator.identity;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.greaterThan;
+import static org.hamcrest.Matchers.instanceOf;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.nullValue;
 import static org.hamcrest.Matchers.startsWith;
@@ -81,11 +84,16 @@ class PublisherBufferConcurrencyTest {
                                     is(1))));
     }
 
-    @ParameterizedTest(name = "{displayName} [{index}]: overlap={0}")
-    @ValueSource(booleans = {false, true})
-    void addingAndBoundaryEmission(boolean overlap) throws Exception {
+    private enum BoundarySignal { ROTATE, ERROR, COMPLETE, CANCEL }
+
+    @ParameterizedTest(name = "{displayName} [{index}]: overlap={0}, signal={1}")
+    @CsvSource({"false,ROTATE", "true,ROTATE", "false,ERROR", "true,ERROR",
+            "false,COMPLETE", "true,COMPLETE", "false,CANCEL", "true,CANCEL"})
+    void addingAndBoundaryEmission(boolean overlap, BoundarySignal signal) throws Exception {
         try (ConcurrentTestScenario scenario = new ConcurrentTestScenario(1)) {
             TestPublisher<Integer> original = new TestPublisher<>();
+            AtomicBoolean originalCancelled = new AtomicBoolean();
+            AtomicBoolean boundariesCancelled = new AtomicBoolean();
             TestPublisher<Accumulator<Integer, Integer>> boundaries = new TestPublisher<>();
             TestPublisherSubscriber<Integer> subscriber = new TestPublisherSubscriber<>();
             ConcurrentTestScenario.Checkpoint adding = scenario.checkpoint("accumulator entered");
@@ -104,10 +112,11 @@ class PublisherBufferConcurrencyTest {
                     return added;
                 }
             };
-            toSource(original.buffer(new BufferStrategy<Integer, Accumulator<Integer, Integer>, Integer>() {
+            toSource(original.beforeCancel(() -> originalCancelled.set(true))
+                    .buffer(new BufferStrategy<Integer, Accumulator<Integer, Integer>, Integer>() {
                 @Override
                 public Publisher<Accumulator<Integer, Integer>> boundaries() {
-                    return boundaries;
+                    return boundaries.beforeCancel(() -> boundariesCancelled.set(true));
                 }
 
                 @Override
@@ -117,13 +126,41 @@ class PublisherBufferConcurrencyTest {
             })).subscribe(subscriber);
             subscriber.awaitSubscription().request(1);
             boundaries.onNext(accumulator); // initial boundary
-            assertThat(subscriber.pollOnNext(10, MILLISECONDS), is(nullValue()));
+            assertThat(subscriber.pollOnNext(0, MILLISECONDS), is(nullValue()));
 
             Future<?> add = scenario.actor("add item", () -> original.onNext(1));
             adding.awaitReached();
             if (!overlap) {
                 adding.release();
                 scenario.awaitActor(add);
+            }
+            if (signal != BoundarySignal.ROTATE) {
+                switch (signal) {
+                    case ERROR:
+                        boundaries.onError(DELIBERATE_EXCEPTION);
+                        break;
+                    case COMPLETE:
+                        boundaries.onComplete();
+                        break;
+                    case CANCEL:
+                        subscriber.awaitSubscription().cancel();
+                        break;
+                    default:
+                        throw new AssertionError(signal);
+                }
+                adding.release();
+                scenario.awaitActor(add);
+                assertThat(originalCancelled.get(), is(true));
+                if (signal == BoundarySignal.ERROR) {
+                    assertThat(subscriber.awaitOnError(), is(DELIBERATE_EXCEPTION));
+                } else if (signal == BoundarySignal.COMPLETE) {
+                    assertThat(subscriber.awaitOnError(), instanceOf(IllegalStateException.class));
+                } else {
+                    assertThat(boundariesCancelled.get(), is(true));
+                    assertThat(subscriber.pollTerminal(0, MILLISECONDS), is(nullValue()));
+                }
+                assertThat(subscriber.pollAllOnNext(), is(empty()));
+                return;
             }
             subscriber.awaitSubscription().request(1);
             boundaries.onNext(new SummingAccumulator());
