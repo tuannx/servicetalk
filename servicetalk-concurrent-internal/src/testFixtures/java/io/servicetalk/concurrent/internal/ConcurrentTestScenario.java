@@ -19,11 +19,13 @@ import org.junit.jupiter.api.function.Executable;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static io.servicetalk.concurrent.internal.TimeoutTracingInfoExtension.DEFAULT_TIMEOUT_SECONDS;
@@ -96,11 +98,17 @@ public final class ConcurrentTestScenario implements AutoCloseable {
     public void awaitActors() throws Exception {
         final long start = System.nanoTime();
         final long budget = unit.toNanos(timeout);
-        ExecutionException failure = null;
+        Exception failure = null;
         for (Future<?> actor : actors) {
             try {
                 actor.get(Math.max(0, budget - (System.nanoTime() - start)), NANOSECONDS);
-            } catch (ExecutionException cause) {
+            } catch (InterruptedException cause) {
+                if (failure != null) {
+                    cause.addSuppressed(failure);
+                }
+                Thread.currentThread().interrupt();
+                throw cause;
+            } catch (ExecutionException | CancellationException | TimeoutException cause) {
                 if (failure == null) {
                     failure = cause;
                 } else {
@@ -126,7 +134,14 @@ public final class ConcurrentTestScenario implements AutoCloseable {
             awaitActors();
         } finally {
             executor.shutdownNow();
-            assertTrue(executor.awaitTermination(timeout, unit), "Scenario actors did not terminate");
+            final boolean interrupted = Thread.interrupted();
+            try {
+                assertTrue(executor.awaitTermination(timeout, unit), "Scenario actors did not terminate");
+            } finally {
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            }
         }
     }
 

@@ -36,5 +36,5 @@
   <suppress id="ConsolePrint"
             files="io[\\/]servicetalk[\\/]concurrent[\\/]api[\\/]DefaultAsyncContextProvider.java"/>
   <!-- The JDI fixture is launched in a child JVM and requires an executable main method. -->
-  <suppress checks="UncommentedMain" files="SequentialSubscriptionJdiTest.java"/>
+  <suppress checks="UncommentedMain" files="(SequentialSubscriptionJdiTest|JdiTestScenarioTest).java"/>
 </suppressions>
