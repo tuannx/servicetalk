@@ -34,11 +34,14 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.nullValue;
 
 final class ReplayPublisherConcurrencyTest {
-    @ParameterizedTest(name = "{displayName} [{index}]: overlap={0}, onError={1}")
-    @CsvSource({"false,false", "false,true", "true,false", "true,true"})
-    void expirationPreservesItemsAddedAtCurrentTime(boolean overlap, boolean onError) throws Exception {
+    @ParameterizedTest(name = "{displayName} [{index}]: overlap={0}, onError={1}, cancelObserver={2}")
+    @CsvSource({"false,false,false", "false,false,true", "false,true,false", "false,true,true",
+            "true,false,false", "true,false,true", "true,true,false", "true,true,true"})
+    void expirationPreservesItemsAddedAtCurrentTime(boolean overlap, boolean onError,
+                                                     boolean cancelObserver) throws Exception {
         final TestExecutor clock = new TestExecutor(0);
         try (ConcurrentTestScenario scenario = new ConcurrentTestScenario(2)) {
             final ConcurrentTestScenario.Checkpoint expiring = scenario.checkpoint("timer reads expiration time");
@@ -61,6 +64,9 @@ final class ReplayPublisherConcurrencyTest {
             toSource(replay).subscribe(live);
             live.awaitSubscription().request(Long.MAX_VALUE);
             source.onNext(1);
+            final TestPublisherSubscriber<Integer> delayed = new TestPublisherSubscriber<>();
+            toSource(replay).subscribe(delayed);
+            delayed.awaitSubscription(); // Hold downstream demand while expiry and fresh items race.
             clock.advanceTimeByNoExecuteTasks(10, NANOSECONDS);
             final Future<?> expiration = scenario.actor("expire old item", () -> {
                 timerThread.set(Thread.currentThread());
@@ -71,7 +77,12 @@ final class ReplayPublisherConcurrencyTest {
             } else {
                 scenario.awaitActor(expiration);
             }
-            scenario.awaitActor(scenario.actor("add fresh item", () -> source.onNext(2)));
+            scenario.awaitActor(scenario.actor("add fresh item", () -> {
+                if (cancelObserver) {
+                    delayed.awaitSubscription().cancel();
+                }
+                source.onNext(2);
+            }));
             expiring.release();
             scenario.awaitActor(expiration);
 
@@ -84,18 +95,32 @@ final class ReplayPublisherConcurrencyTest {
             expired.awaitSubscription().request(Long.MAX_VALUE);
             assertThat(live.takeOnNext(2), contains(1, 2));
             assertThat(recent.takeOnNext(), is(2));
+            if (!cancelObserver) {
+                delayed.awaitSubscription().request(2);
+                assertThat(delayed.takeOnNext(2), contains(1, 2));
+            }
             if (onError) {
                 source.onError(DELIBERATE_EXCEPTION);
                 assertThat(live.awaitOnError(), is(DELIBERATE_EXCEPTION));
                 assertThat(recent.awaitOnError(), is(DELIBERATE_EXCEPTION));
                 assertThat(expired.awaitOnError(), is(DELIBERATE_EXCEPTION));
+                if (!cancelObserver) {
+                    assertThat(delayed.awaitOnError(), is(DELIBERATE_EXCEPTION));
+                }
             } else {
                 source.onComplete();
                 live.awaitOnComplete();
                 recent.awaitOnComplete();
                 expired.awaitOnComplete();
+                if (!cancelObserver) {
+                    delayed.awaitOnComplete();
+                }
             }
             assertThat(expired.pollAllOnNext(), is(empty()));
+            if (cancelObserver) {
+                assertThat(delayed.pollAllOnNext(), is(empty()));
+                assertThat(delayed.pollTerminal(0, NANOSECONDS), is(nullValue()));
+            }
         } finally {
             clock.closeAsync().toFuture().get();
         }
