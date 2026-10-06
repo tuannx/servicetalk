@@ -13,30 +13,37 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package io.servicetalk.concurrent.api;
+package io.servicetalk.concurrent.internal;
+
+import org.junit.jupiter.api.function.Executable;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static io.servicetalk.concurrent.internal.TimeoutTracingInfoExtension.DEFAULT_TIMEOUT_SECONDS;
-import static io.servicetalk.concurrent.test.internal.AwaitUtils.await;
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.Executors.newFixedThreadPool;
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
-import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.is;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Test-local POC for explicitly scheduled actors. The test thread owns registration and joins;
+ * Fixture for explicitly scheduled actors. The test thread owns registration and joins;
  * actors may reach checkpoints. Domain objects and invariants belong to the calling test.
  * This coordinates callback boundaries, not arbitrary instructions inside production code.
+ * The actor limit counts total submissions; each checkpoint is one-shot. Waiting for all actors
+ * shares one timeout budget, while checkpoint waits and cleanup each have their own budget.
+ * Actions must be interruptible; this fixture cannot forcibly stop arbitrary Java code.
  */
-final class ConcurrentTestScenario implements AutoCloseable {
+public final class ConcurrentTestScenario implements AutoCloseable {
     private final int actorCount;
     private final long timeout;
     private final TimeUnit unit;
@@ -45,11 +52,11 @@ final class ConcurrentTestScenario implements AutoCloseable {
     private final List<Checkpoint> checkpoints = new ArrayList<>();
     private boolean closed;
 
-    ConcurrentTestScenario(int actorCount) {
+    public ConcurrentTestScenario(int actorCount) {
         this(actorCount, DEFAULT_TIMEOUT_SECONDS, SECONDS);
     }
 
-    ConcurrentTestScenario(int actorCount, long timeout, TimeUnit unit) {
+    public ConcurrentTestScenario(int actorCount, long timeout, TimeUnit unit) {
         if (actorCount <= 0 || timeout <= 0) {
             throw new IllegalArgumentException("Actor count and timeout must be positive");
         }
@@ -59,14 +66,14 @@ final class ConcurrentTestScenario implements AutoCloseable {
         executor = newFixedThreadPool(actorCount);
     }
 
-    Checkpoint checkpoint(String name) {
+    public Checkpoint checkpoint(String name) {
         checkOpen();
         final Checkpoint checkpoint = new Checkpoint(name, timeout, unit);
         checkpoints.add(checkpoint);
         return checkpoint;
     }
 
-    Future<?> actor(String name, Runnable action) {
+    public Future<?> actor(String name, Executable action) {
         checkOpen();
         requireNonNull(name);
         requireNonNull(action);
@@ -75,7 +82,7 @@ final class ConcurrentTestScenario implements AutoCloseable {
         }
         final Future<?> actor = executor.submit(() -> {
             try {
-                action.run();
+                action.execute();
             } catch (Throwable cause) {
                 throw new AssertionError("Actor failed: " + name, cause);
             }
@@ -84,13 +91,33 @@ final class ConcurrentTestScenario implements AutoCloseable {
         return actor;
     }
 
-    void awaitActor(Future<?> actor) throws Exception {
+    public void awaitActor(Future<?> actor) throws Exception {
         actor.get(timeout, unit);
     }
 
-    void awaitActors() throws Exception {
+    public void awaitActors() throws Exception {
+        final long start = System.nanoTime();
+        final long budget = unit.toNanos(timeout);
+        Exception failure = null;
         for (Future<?> actor : actors) {
-            awaitActor(actor);
+            try {
+                actor.get(Math.max(0, budget - (System.nanoTime() - start)), NANOSECONDS);
+            } catch (InterruptedException cause) {
+                if (failure != null) {
+                    cause.addSuppressed(failure);
+                }
+                Thread.currentThread().interrupt();
+                throw cause;
+            } catch (ExecutionException | CancellationException | TimeoutException cause) {
+                if (failure == null) {
+                    failure = cause;
+                } else {
+                    failure.addSuppressed(cause);
+                }
+            }
+        }
+        if (failure != null) {
+            throw failure;
         }
     }
 
@@ -107,7 +134,14 @@ final class ConcurrentTestScenario implements AutoCloseable {
             awaitActors();
         } finally {
             executor.shutdownNow();
-            assertThat("Scenario actors did not terminate", executor.awaitTermination(timeout, unit), is(true));
+            final boolean interrupted = Thread.interrupted();
+            try {
+                assertTrue(executor.awaitTermination(timeout, unit), "Scenario actors did not terminate");
+            } finally {
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            }
         }
     }
 
@@ -118,7 +152,7 @@ final class ConcurrentTestScenario implements AutoCloseable {
     }
 
     /** A one-shot pause for one actor, with a separately observable arrival. */
-    static final class Checkpoint {
+    public static final class Checkpoint {
         private final String name;
         private final long timeout;
         private final TimeUnit unit;
@@ -132,20 +166,34 @@ final class ConcurrentTestScenario implements AutoCloseable {
             this.unit = unit;
         }
 
-        void pause() {
+        public void pause() {
+            arrive();
+            await(released, "Checkpoint was not released: " + name);
+        }
+
+        /** Signal arrival without blocking the caller, for example a transport event loop. */
+        public void arrive() {
             if (!entered.compareAndSet(false, true)) {
                 throw new IllegalStateException("Checkpoint already used: " + name);
             }
             reached.countDown();
-            assertThat("Checkpoint was not released: " + name, await(released, timeout, unit), is(true));
         }
 
-        void awaitReached() {
-            assertThat("Checkpoint was not reached: " + name, await(reached, timeout, unit), is(true));
+        public void awaitReached() {
+            await(reached, "Checkpoint was not reached: " + name);
         }
 
-        void release() {
+        public void release() {
             released.countDown();
+        }
+
+        private void await(CountDownLatch latch, String message) {
+            try {
+                assertTrue(latch.await(timeout, unit), message);
+            } catch (InterruptedException cause) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError(message, cause);
+            }
         }
     }
 }
