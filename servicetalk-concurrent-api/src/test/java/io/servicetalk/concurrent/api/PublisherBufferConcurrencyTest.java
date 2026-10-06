@@ -16,13 +16,16 @@
 package io.servicetalk.concurrent.api;
 
 import io.servicetalk.concurrent.api.BufferStrategy.Accumulator;
+import io.servicetalk.concurrent.internal.ConcurrentTestScenario;
 import io.servicetalk.concurrent.test.internal.TestPublisherSubscriber;
 import io.servicetalk.context.api.ContextMap;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
-import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Future;
 import java.util.function.Consumer;
 import java.util.function.UnaryOperator;
 import javax.annotation.Nullable;
@@ -32,7 +35,6 @@ import static io.servicetalk.concurrent.api.ExecutorExtension.withCachedExecutor
 import static io.servicetalk.concurrent.api.SourceAdapters.toSource;
 import static io.servicetalk.concurrent.internal.DeliberateException.DELIBERATE_EXCEPTION;
 import static io.servicetalk.context.api.ContextMap.Key.newKey;
-import static io.servicetalk.utils.internal.ThrowableUtils.throwException;
 import static java.time.Duration.ofMillis;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.function.UnaryOperator.identity;
@@ -79,67 +81,64 @@ class PublisherBufferConcurrencyTest {
                                     is(1))));
     }
 
-    @Test
-    void addingAndBoundaryEmission() throws Exception {
-        TestPublisher<Integer> original = new TestPublisher<>();
-        TestPublisher<Accumulator<Integer, Integer>> boundaries = new TestPublisher<>();
-        TestPublisherSubscriber<Integer> subscriber = new TestPublisherSubscriber<>();
-        CountDownLatch waitForBoundary = new CountDownLatch(1);
-        CountDownLatch waitForAdd = new CountDownLatch(1);
-        Accumulator<Integer, Integer> accumulator = new Accumulator<Integer, Integer>() {
-            private int added;
-            @Override
-            public void accumulate(@Nullable final Integer integer) {
-                waitForAdd.countDown();
-                try {
-                    waitForBoundary.await();
-                    if (integer == null) {
-                        return;
+    @ParameterizedTest(name = "{displayName} [{index}]: overlap={0}")
+    @ValueSource(booleans = {false, true})
+    void addingAndBoundaryEmission(boolean overlap) throws Exception {
+        try (ConcurrentTestScenario scenario = new ConcurrentTestScenario(1)) {
+            TestPublisher<Integer> original = new TestPublisher<>();
+            TestPublisher<Accumulator<Integer, Integer>> boundaries = new TestPublisher<>();
+            TestPublisherSubscriber<Integer> subscriber = new TestPublisherSubscriber<>();
+            ConcurrentTestScenario.Checkpoint adding = scenario.checkpoint("accumulator entered");
+            Accumulator<Integer, Integer> accumulator = new Accumulator<Integer, Integer>() {
+                private int added;
+                @Override
+                public void accumulate(@Nullable final Integer integer) {
+                    adding.pause();
+                    if (integer != null) {
+                        added = integer;
                     }
-                    added = integer;
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    throwException(e);
                 }
+
+                @Override
+                public Integer finish() {
+                    return added;
+                }
+            };
+            toSource(original.buffer(new BufferStrategy<Integer, Accumulator<Integer, Integer>, Integer>() {
+                @Override
+                public Publisher<Accumulator<Integer, Integer>> boundaries() {
+                    return boundaries;
+                }
+
+                @Override
+                public int bufferSizeHint() {
+                    return 8;
+                }
+            })).subscribe(subscriber);
+            subscriber.awaitSubscription().request(1);
+            boundaries.onNext(accumulator); // initial boundary
+            assertThat(subscriber.pollOnNext(10, MILLISECONDS), is(nullValue()));
+
+            Future<?> add = scenario.actor("add item", () -> original.onNext(1));
+            adding.awaitReached();
+            if (!overlap) {
+                adding.release();
+                scenario.awaitActor(add);
             }
+            subscriber.awaitSubscription().request(1);
+            boundaries.onNext(new SummingAccumulator());
+            adding.release();
+            scenario.awaitActor(add);
 
-            @Override
-            public Integer finish() {
-                return added;
-            }
-        };
-        toSource(original.buffer(new BufferStrategy<Integer, Accumulator<Integer, Integer>, Integer>() {
-            @Override
-            public Publisher<Accumulator<Integer, Integer>> boundaries() {
-                return boundaries;
-            }
+            boundaries.onNext(new SummingAccumulator()); // Last accumulator will be overwritten by add()
+            assertThat("Unexpected result.", subscriber.takeOnNext(), is(1));
 
-            @Override
-            public int bufferSizeHint() {
-                return 8;
-            }
-        })).subscribe(subscriber);
-        subscriber.awaitSubscription().request(1);
-        boundaries.onNext(accumulator); // initial boundary
-        assertThat(subscriber.pollOnNext(10, MILLISECONDS), is(nullValue()));
+            original.onComplete();
+            boundaries.onNext(new SummingAccumulator()); // Boundary has to complete for terminal to be emitted
+            assertThat("Unexpected result.", subscriber.takeOnNext(), is(0)); // empty accumulator
 
-        CountDownLatch waitForOnNextReturn = new CountDownLatch(1);
-        EXEC.executor().submit(() -> original.onNext(1))
-            .beforeFinally(waitForOnNextReturn::countDown).subscribe();
-        waitForAdd.await();
-        subscriber.awaitSubscription().request(1);
-        boundaries.onNext(new SummingAccumulator());
-        waitForBoundary.countDown();
-        waitForOnNextReturn.await();
-
-        boundaries.onNext(new SummingAccumulator()); // Last accumulator will be overwritten by add()
-        assertThat("Unexpected result.", subscriber.takeOnNext(), is(1));
-
-        original.onComplete();
-        boundaries.onNext(new SummingAccumulator()); // Boundary has to complete for terminal to be emitted
-        assertThat("Unexpected result.", subscriber.takeOnNext(), is(0)); // empty accumulator
-
-        subscriber.awaitOnComplete();
+            subscriber.awaitOnComplete();
+        }
     }
 
     private void runTest(final UnaryOperator<Publisher<Integer>> beforeBuffer,
