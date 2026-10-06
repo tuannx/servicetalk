@@ -16,6 +16,7 @@
 package io.servicetalk.concurrent.api;
 
 import io.servicetalk.concurrent.PublisherSource.Subscription;
+import io.servicetalk.concurrent.internal.ConcurrentTestScenario;
 
 import com.sun.jdi.BooleanValue;
 import com.sun.jdi.Bootstrap;

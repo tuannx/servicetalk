@@ -13,10 +13,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package io.servicetalk.concurrent.api;
+package io.servicetalk.concurrent.internal;
 
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -92,6 +93,57 @@ final class ConcurrentTestScenarioTest {
             scenario.actor("first", checkpoint::pause);
             checkpoint.awaitReached();
             assertThrows(IllegalStateException.class, () -> scenario.actor("extra", () -> { }));
+        }
+    }
+
+    @Test
+    void closeCollectsFailuresFromAllActors() {
+        final ConcurrentTestScenario scenario = new ConcurrentTestScenario(2);
+        scenario.actor("first", () -> {
+            throw DELIBERATE_EXCEPTION;
+        });
+        scenario.actor("second", () -> {
+            throw DELIBERATE_EXCEPTION;
+        });
+        final ExecutionException failure = assertThrows(ExecutionException.class, scenario::close);
+        assertThat(failure.getCause().getMessage(), containsString("first"));
+        assertThat(failure.getSuppressed().length, is(1));
+        assertThat(failure.getSuppressed()[0].getCause().getMessage(), containsString("second"));
+    }
+
+    @Test
+    void actorPropagatesCheckedException() {
+        final IOException expected = new IOException("controlled I/O failure");
+        final ConcurrentTestScenario scenario = new ConcurrentTestScenario(1);
+        scenario.actor("I/O", () -> {
+            throw expected;
+        });
+        final ExecutionException failure = assertThrows(ExecutionException.class, scenario::close);
+        assertThat(failure.getCause().getCause(), is(sameInstance(expected)));
+    }
+
+    @Test
+    void invalidCapacityAndTimeoutAreRejected() {
+        assertThrows(IllegalArgumentException.class, () -> new ConcurrentTestScenario(0));
+        assertThrows(IllegalArgumentException.class, () -> new ConcurrentTestScenario(1, 0, MILLISECONDS));
+    }
+
+    @Test
+    void registrationAfterCloseIsRejected() throws Exception {
+        final ConcurrentTestScenario scenario = new ConcurrentTestScenario(1);
+        scenario.close();
+        assertThrows(IllegalStateException.class, () -> scenario.checkpoint("late"));
+        assertThrows(IllegalStateException.class, () -> scenario.actor("late", () -> { }));
+        scenario.close();
+    }
+
+    @Test
+    void arrivalDoesNotWaitForRelease() throws Exception {
+        try (ConcurrentTestScenario scenario = new ConcurrentTestScenario(1)) {
+            final ConcurrentTestScenario.Checkpoint checkpoint = scenario.checkpoint("nonblocking arrival");
+            scenario.awaitActor(scenario.actor("callback", checkpoint::arrive));
+            checkpoint.awaitReached();
+            assertThrows(IllegalStateException.class, checkpoint::arrive);
         }
     }
 }
