@@ -1,5 +1,5 @@
 /*
- * Copyright © 2020-2021 Apple Inc. and the ServiceTalk project authors
+ * Copyright © 2020-2026 Apple Inc. and the ServiceTalk project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,13 +16,17 @@
 package io.servicetalk.concurrent.api;
 
 import io.servicetalk.concurrent.api.BufferStrategy.Accumulator;
+import io.servicetalk.concurrent.internal.ConcurrentTestScenario;
 import io.servicetalk.concurrent.test.internal.TestPublisherSubscriber;
 import io.servicetalk.context.api.ContextMap;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
-import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.function.UnaryOperator;
 import javax.annotation.Nullable;
@@ -32,12 +36,13 @@ import static io.servicetalk.concurrent.api.ExecutorExtension.withCachedExecutor
 import static io.servicetalk.concurrent.api.SourceAdapters.toSource;
 import static io.servicetalk.concurrent.internal.DeliberateException.DELIBERATE_EXCEPTION;
 import static io.servicetalk.context.api.ContextMap.Key.newKey;
-import static io.servicetalk.utils.internal.ThrowableUtils.throwException;
 import static java.time.Duration.ofMillis;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.function.UnaryOperator.identity;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.greaterThan;
+import static org.hamcrest.Matchers.instanceOf;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.nullValue;
 import static org.hamcrest.Matchers.startsWith;
@@ -79,67 +84,98 @@ class PublisherBufferConcurrencyTest {
                                     is(1))));
     }
 
-    @Test
-    void addingAndBoundaryEmission() throws Exception {
-        TestPublisher<Integer> original = new TestPublisher<>();
-        TestPublisher<Accumulator<Integer, Integer>> boundaries = new TestPublisher<>();
-        TestPublisherSubscriber<Integer> subscriber = new TestPublisherSubscriber<>();
-        CountDownLatch waitForBoundary = new CountDownLatch(1);
-        CountDownLatch waitForAdd = new CountDownLatch(1);
-        Accumulator<Integer, Integer> accumulator = new Accumulator<Integer, Integer>() {
-            private int added;
-            @Override
-            public void accumulate(@Nullable final Integer integer) {
-                waitForAdd.countDown();
-                try {
-                    waitForBoundary.await();
-                    if (integer == null) {
-                        return;
+    private enum BoundarySignal { ROTATE, ERROR, COMPLETE, CANCEL }
+
+    @ParameterizedTest(name = "{displayName} [{index}]: overlap={0}, signal={1}")
+    @CsvSource({"false,ROTATE", "true,ROTATE", "false,ERROR", "true,ERROR",
+            "false,COMPLETE", "true,COMPLETE", "false,CANCEL", "true,CANCEL"})
+    void addingAndBoundaryEmission(boolean overlap, BoundarySignal signal) throws Exception {
+        try (ConcurrentTestScenario scenario = new ConcurrentTestScenario(1)) {
+            TestPublisher<Integer> original = new TestPublisher<>();
+            AtomicBoolean originalCancelled = new AtomicBoolean();
+            AtomicBoolean boundariesCancelled = new AtomicBoolean();
+            TestPublisher<Accumulator<Integer, Integer>> boundaries = new TestPublisher<>();
+            TestPublisherSubscriber<Integer> subscriber = new TestPublisherSubscriber<>();
+            ConcurrentTestScenario.Checkpoint adding = scenario.checkpoint("accumulator entered");
+            Accumulator<Integer, Integer> accumulator = new Accumulator<Integer, Integer>() {
+                private int added;
+                @Override
+                public void accumulate(@Nullable final Integer integer) {
+                    adding.pause();
+                    if (integer != null) {
+                        added = integer;
                     }
-                    added = integer;
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    throwException(e);
                 }
+
+                @Override
+                public Integer finish() {
+                    return added;
+                }
+            };
+            toSource(original.beforeCancel(() -> originalCancelled.set(true))
+                    .buffer(new BufferStrategy<Integer, Accumulator<Integer, Integer>, Integer>() {
+                @Override
+                public Publisher<Accumulator<Integer, Integer>> boundaries() {
+                    return boundaries.beforeCancel(() -> boundariesCancelled.set(true));
+                }
+
+                @Override
+                public int bufferSizeHint() {
+                    return 8;
+                }
+            })).subscribe(subscriber);
+            subscriber.awaitSubscription().request(1);
+            boundaries.onNext(accumulator); // initial boundary
+            assertThat(subscriber.pollOnNext(0, MILLISECONDS), is(nullValue()));
+
+            Future<?> add = scenario.actor("add item", () -> original.onNext(1));
+            adding.awaitReached();
+            if (!overlap) {
+                adding.release();
+                scenario.awaitActor(add);
             }
-
-            @Override
-            public Integer finish() {
-                return added;
+            if (signal != BoundarySignal.ROTATE) {
+                switch (signal) {
+                    case ERROR:
+                        boundaries.onError(DELIBERATE_EXCEPTION);
+                        break;
+                    case COMPLETE:
+                        boundaries.onComplete();
+                        break;
+                    case CANCEL:
+                        subscriber.awaitSubscription().cancel();
+                        break;
+                    default:
+                        throw new AssertionError(signal);
+                }
+                adding.release();
+                scenario.awaitActor(add);
+                assertThat(originalCancelled.get(), is(true));
+                if (signal == BoundarySignal.ERROR) {
+                    assertThat(subscriber.awaitOnError(), is(DELIBERATE_EXCEPTION));
+                } else if (signal == BoundarySignal.COMPLETE) {
+                    assertThat(subscriber.awaitOnError(), instanceOf(IllegalStateException.class));
+                } else {
+                    assertThat(boundariesCancelled.get(), is(true));
+                    assertThat(subscriber.pollTerminal(0, MILLISECONDS), is(nullValue()));
+                }
+                assertThat(subscriber.pollAllOnNext(), is(empty()));
+                return;
             }
-        };
-        toSource(original.buffer(new BufferStrategy<Integer, Accumulator<Integer, Integer>, Integer>() {
-            @Override
-            public Publisher<Accumulator<Integer, Integer>> boundaries() {
-                return boundaries;
-            }
+            subscriber.awaitSubscription().request(1);
+            boundaries.onNext(new SummingAccumulator());
+            adding.release();
+            scenario.awaitActor(add);
 
-            @Override
-            public int bufferSizeHint() {
-                return 8;
-            }
-        })).subscribe(subscriber);
-        subscriber.awaitSubscription().request(1);
-        boundaries.onNext(accumulator); // initial boundary
-        assertThat(subscriber.pollOnNext(10, MILLISECONDS), is(nullValue()));
+            boundaries.onNext(new SummingAccumulator()); // Last accumulator will be overwritten by add()
+            assertThat("Unexpected result.", subscriber.takeOnNext(), is(1));
 
-        CountDownLatch waitForOnNextReturn = new CountDownLatch(1);
-        EXEC.executor().submit(() -> original.onNext(1))
-            .beforeFinally(waitForOnNextReturn::countDown).subscribe();
-        waitForAdd.await();
-        subscriber.awaitSubscription().request(1);
-        boundaries.onNext(new SummingAccumulator());
-        waitForBoundary.countDown();
-        waitForOnNextReturn.await();
+            original.onComplete();
+            boundaries.onNext(new SummingAccumulator()); // Boundary has to complete for terminal to be emitted
+            assertThat("Unexpected result.", subscriber.takeOnNext(), is(0)); // empty accumulator
 
-        boundaries.onNext(new SummingAccumulator()); // Last accumulator will be overwritten by add()
-        assertThat("Unexpected result.", subscriber.takeOnNext(), is(1));
-
-        original.onComplete();
-        boundaries.onNext(new SummingAccumulator()); // Boundary has to complete for terminal to be emitted
-        assertThat("Unexpected result.", subscriber.takeOnNext(), is(0)); // empty accumulator
-
-        subscriber.awaitOnComplete();
+            subscriber.awaitOnComplete();
+        }
     }
 
     private void runTest(final UnaryOperator<Publisher<Integer>> beforeBuffer,
