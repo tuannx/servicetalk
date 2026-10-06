@@ -18,13 +18,16 @@ package io.servicetalk.concurrent.internal;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static io.servicetalk.concurrent.internal.DeliberateException.DELIBERATE_EXCEPTION;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.instanceOf;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.sameInstance;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -135,6 +138,38 @@ final class ConcurrentTestScenarioTest {
         assertThrows(IllegalStateException.class, () -> scenario.checkpoint("late"));
         assertThrows(IllegalStateException.class, () -> scenario.actor("late", () -> { }));
         scenario.close();
+    }
+
+    @Test
+    void closePreservesFailureWhenAnotherActorWasCancelled() throws Exception {
+        final ConcurrentTestScenario scenario = new ConcurrentTestScenario(2);
+        final Future<?> failed = scenario.actor("failed", () -> {
+            throw DELIBERATE_EXCEPTION;
+        });
+        assertThrows(ExecutionException.class, () -> scenario.awaitActor(failed));
+        final ConcurrentTestScenario.Checkpoint paused = scenario.checkpoint("cancelled actor");
+        final Future<?> cancelled = scenario.actor("cancelled", paused::pause);
+        paused.awaitReached();
+        assertThat(cancelled.cancel(true), is(true));
+        final ExecutionException failure = assertThrows(ExecutionException.class, scenario::close);
+        assertThat(failure.getCause().getCause(), is(sameInstance(DELIBERATE_EXCEPTION)));
+        assertThat(failure.getSuppressed().length, is(1));
+        assertThat(failure.getSuppressed()[0], instanceOf(CancellationException.class));
+    }
+
+    @Test
+    void interruptedCheckpointPreservesInterrupt() throws Exception {
+        try (ConcurrentTestScenario scenario = new ConcurrentTestScenario(1)) {
+            try {
+                Thread.currentThread().interrupt();
+                final AssertionError failure = assertThrows(AssertionError.class,
+                        () -> scenario.checkpoint("interrupted").awaitReached());
+                assertThat(failure.getCause(), instanceOf(InterruptedException.class));
+                assertThat(Thread.currentThread().isInterrupted(), is(true));
+            } finally {
+                Thread.interrupted();
+            }
+        }
     }
 
     @Test
