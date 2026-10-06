@@ -200,8 +200,11 @@ jobs:
         continue-on-error: true
         run: |
           mkdir -p native-artifacts
+          rm -f native-artifacts/tests.log
+          rm -rf servicetalk-concurrent-api/build/test-results/test
           java -version > native-artifacts/java-version.txt 2>&1
           /usr/bin/time -p ./gradlew :servicetalk-concurrent-api:test --no-daemon --max-workers=2 \
+            --rerun-tasks --no-build-cache \
             --tests io.servicetalk.concurrent.api.SequentialSubscriptionTest \
             --tests io.servicetalk.concurrent.api.PublisherBufferConcurrencyTest \
             > native-artifacts/tests.log 2> native-artifacts/test-runtime.txt
@@ -218,7 +221,13 @@ jobs:
           from pathlib import Path
 
           suites = []
-          for file in sorted(Path('servicetalk-concurrent-api/build/test-results/test').glob('TEST-*.xml')):
+          test_log = Path('native-artifacts/tests.log')
+          test_task = '> Task :servicetalk-concurrent-api:test'
+          task_executed = os.environ['TEST_OUTCOME'] in ('success', 'failure') and test_log.exists()
+          task_executed = task_executed and any(
+              line in (test_task, test_task + ' FAILED') for line in test_log.read_text().splitlines())
+          files = sorted(Path('servicetalk-concurrent-api/build/test-results/test').glob('TEST-*.xml'))
+          for file in files if task_executed else []:
               suite = ET.parse(file).getroot()
               suites.append({**suite.attrib, 'failedCases': [case.attrib['name']
                   for case in suite.findall('testcase') if case.find('failure') is not None]})
@@ -238,6 +247,7 @@ jobs:
         if: '!cancelled()'
         run: |
           /usr/bin/time -p ./gradlew :servicetalk-concurrent-api:quality --no-daemon --max-workers=2 \
+            --rerun-tasks --no-build-cache \
             > native-artifacts/quality.log 2> native-artifacts/quality-runtime.txt
       - name: Upload native measurements
         if: '!cancelled()'
