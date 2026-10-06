@@ -1,5 +1,5 @@
 /*
- * Copyright © 2018-2019 Apple Inc. and the ServiceTalk project authors
+ * Copyright © 2018-2026 Apple Inc. and the ServiceTalk project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,8 +19,13 @@ import io.servicetalk.concurrent.PublisherSource.Subscriber;
 import io.servicetalk.concurrent.PublisherSource.Subscription;
 import io.servicetalk.concurrent.internal.FlowControlUtils;
 
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
+import javax.annotation.Nullable;
 
+import static io.servicetalk.concurrent.internal.ConcurrentUtils.releaseLock;
+import static io.servicetalk.concurrent.internal.ConcurrentUtils.tryAcquireLock;
 import static io.servicetalk.concurrent.internal.EmptySubscriptions.EMPTY_SUBSCRIPTION_NO_THROW;
 import static io.servicetalk.concurrent.internal.SubscriberUtils.isRequestNValid;
 import static java.util.Objects.requireNonNull;
@@ -47,6 +52,15 @@ final class SequentialSubscription implements Subscription {
     private static final AtomicLongFieldUpdater<SequentialSubscription> sourceRequestedUpdater =
             newUpdater(SequentialSubscription.class, "sourceRequested");
 
+    private static final AtomicIntegerFieldUpdater<SequentialSubscription> switchingUpdater =
+            AtomicIntegerFieldUpdater.newUpdater(SequentialSubscription.class, "switching");
+    private static final AtomicReferenceFieldUpdater<SequentialSubscription, Subscription> pendingSubscriptionUpdater =
+            AtomicReferenceFieldUpdater.newUpdater(SequentialSubscription.class, Subscription.class,
+                    "pendingSubscription");
+
+    private volatile int switching;
+    @Nullable
+    private volatile Subscription pendingSubscription;
     private Subscription subscription;
     private long sourceEmitted;
     private volatile long requested;
@@ -130,14 +144,38 @@ final class SequentialSubscription implements Subscription {
      * Switches <strong>current</strong> {@link Subscription} to {@code next}. It is assumed the {@link Subscriber}
      * associated with the previous {@link Subscription} will no longer call {@link #itemReceived()}.
      * <p>
-     * Only can be called in the {@link Subscriber} thread!
+     * Subscriber signals must be serialized, but an earlier request callback may still be unwinding on another thread.
      * @param next {@link Subscription} that should now be <strong>current</strong>.
      */
     void switchTo(Subscription next) {
-        requireNonNull(next);
-        // No special concurrency considerations for sourceEmitted access is required in this method because we are
-        // on the Subscriber thread in this method. We want to track the effective source requested for the purposes of
-        // how much more request(n) is necessary below.
+        final Subscription previous = pendingSubscriptionUpdater.getAndSet(this, requireNonNull(next));
+        try {
+            if (previous != null && sourceRequested == CANCELLED) {
+                final long n = requested;
+                if (n >= 0) {
+                    previous.cancel();
+                } else {
+                    previous.request(n);
+                }
+            }
+        } finally {
+            boolean tryAcquire = true;
+            while (tryAcquire && tryAcquireLock(switchingUpdater, this)) {
+                try {
+                    final Subscription pending = pendingSubscriptionUpdater.getAndSet(this, null);
+                    if (pending != null) {
+                        switchTo0(pending);
+                    }
+                } finally {
+                    tryAcquire = !releaseLock(switchingUpdater, this);
+                }
+            }
+        }
+    }
+
+    private void switchTo0(Subscription next) {
+        // The mailbox publishes the preceding serialized itemReceived calls to the switch owner.
+        // Track the effective source requested to determine how much more request(n) is necessary below.
         long effectiveSourceRequested = sourceEmitted;
         for (;;) {
             final long currSourceRequested = sourceRequested;
@@ -163,9 +201,8 @@ final class SequentialSubscription implements Subscription {
                     break;
                 }
 
-                // sourceEmitted is stable here because we are on the Subscriber thread. We want to request the
-                // difference between total requested and what has been emitted from the new subscription. We also
-                // need to set the value of total requested below to make sure it is monotonically increasing.
+                // Request the difference between total requested and what has been accounted for in this switch.
+                // We also need to keep sourceRequested monotonically increasing between switches.
                 // effectiveSourceRequested ...[delta]... requested
                 final long delta = currRequested - effectiveSourceRequested;
                 assert delta >= 0;
