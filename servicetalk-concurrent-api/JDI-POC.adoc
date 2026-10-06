@@ -1,0 +1,53 @@
+= SequentialSubscription JDI POC
+
+This fork-only experiment adds instruction-level scheduling to the callback-based
+`ConcurrentTestScenario` POC. It does not modify production code or refactor existing tests.
+The additional source set is experimental, not an established ServiceTalk test convention.
+
+== Run
+
+Use JDK 17 to run Gradle, with `TEST_JAVA_VERSION` unset or set to `17`:
+
+[source,shell]
+----
+./gradlew -PjdiPoc :servicetalk-concurrent-api:jdiTest :servicetalk-concurrent-api:quality --continue
+----
+
+The regular `test` task still uses its existing Java compatibility and test sources.
+The JDI source set and task exist only with `-PjdiPoc`; regular PR CI does not run these
+schedules automatically. With the flag, the module's quality tasks also check the JDI sources.
+
+== Two schedules, one invariant
+
+Both cases assert that the replacement receives the outstanding demand of `10`.
+
+* `afterReentryCheck=false`: pause the old switch owner before it checks for reentry.
+  Run the replacement switch to completion, then resume the owner. Expected: green, `10`.
+* `afterReentryCheck=true`: pause after the check, before writing the subscription.
+  Verify the local `reentry` value is false. Run the replacement switch to completion,
+  then resume the owner. Current base: red, `0` instead of `10`.
+
+The test does not accept the bug as a passing outcome. On the current base,
+`jdiTest` must fail exactly the second parameterized case. A third test deliberately
+selects a missing breakpoint and verifies that the harness fails and terminates the child.
+
+== Boundaries
+
+JDI suspends only the event thread. Fixture entry breakpoints gate the replacement and
+confirm that its switch returned before the owner resumes. No production field is written,
+no production method is invoked by the debugger, and there are no timing sleeps.
+The child uses `ConcurrentTestScenario` to own its worker and propagate worker failures.
+The parent checks both breakpoint progress and the child's assertion/exit status, drains
+both output streams, and forcibly terminates the child on failure or timeout.
+
+Executable locations are resolved from unique source anchors and checked against `switchTo`.
+Source drift or missing debug information fails the test rather than silently skipping it.
+A production redesign will require reviewing these implementation-specific anchors.
+
+This proves two controlled schedules, not all interleavings or Java memory-model behaviors.
+Debugger suspension changes execution conditions. The subscriptions emit no items; this is
+a unit-level demand-handoff reproduction, not an end-to-end reproduction of issue #1672.
+
+JDI references:
+https://docs.oracle.com/en/java/javase/17/docs/api/jdk.jdi/com/sun/jdi/request/EventRequest.html[thread suspension policy],
+https://docs.oracle.com/en/java/javase/17/docs/api/jdk.jdi/com/sun/jdi/event/EventSet.html[event-set resume].

@@ -1,5 +1,5 @@
 /*
- * Copyright © 2018-2021 Apple Inc. and the ServiceTalk project authors
+ * Copyright © 2018-2026 Apple Inc. and the ServiceTalk project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -44,4 +44,36 @@ dependencies {
   testFixturesImplementation project(":servicetalk-concurrent-test-internal")
   testFixturesImplementation "com.google.code.findbugs:jsr305:$jsr305Version"
   testFixturesImplementation "org.slf4j:slf4j-api:$slf4jVersion"
+}
+
+// Explicit POC: JDI is outside the Java 8 release API used by the regular tests.
+if (project.hasProperty("jdiPoc")) {
+  if (JavaVersion.current() != JavaVersion.VERSION_17 ||
+      (System.getenv("TEST_JAVA_VERSION") && System.getenv("TEST_JAVA_VERSION") != "17")) {
+    throw new GradleException("The JDI POC requires JDK 17 and TEST_JAVA_VERSION unset or 17")
+  }
+  sourceSets {
+    jdiTest {
+      java.srcDirs = ["src/test/jdi"]
+      compileClasspath = sourceSets.test.compileClasspath + sourceSets.test.output
+      runtimeClasspath = output + sourceSets.test.runtimeClasspath
+    }
+  }
+  tasks.named("compileJdiTestJava", JavaCompile) {
+    options.release = 17
+  }
+  tasks.named("spotbugsJdiTest") {
+    auxClassPaths.from(sourceSets.jdiTest.compileClasspath)
+  }
+  tasks.register("jdiTest", Test) {
+    description = "Run the experimental JDI subscription handoff schedules (JDK 17)"
+    group = "verification"
+    testClassesDirs = sourceSets.jdiTest.output.classesDirs
+    classpath = sourceSets.jdiTest.runtimeClasspath
+    doFirst {
+      systemProperty "jdi.poc.classpath", sourceSets.jdiTest.runtimeClasspath.asPath
+    }
+    systemProperty "jdi.poc.source", file("src/main/java/io/servicetalk/concurrent/api/SequentialSubscription.java")
+    inputs.file("src/main/java/io/servicetalk/concurrent/api/SequentialSubscription.java")
+  }
 }

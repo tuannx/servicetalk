@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  ~ Copyright © 2021 Apple Inc. and the ServiceTalk project authors
+  ~ Copyright © 2021-2026 Apple Inc. and the ServiceTalk project authors
   ~
   ~ Licensed under the Apache License, Version 2.0 (the "License");
   ~ you may not use this file except in compliance with the License.
@@ -35,4 +35,6 @@
   <!--  We can't log at this point, so we must surface errors through the console-->
   <suppress id="ConsolePrint"
             files="io[\\/]servicetalk[\\/]concurrent[\\/]api[\\/]DefaultAsyncContextProvider.java"/>
+  <!-- The JDI fixture is launched in a child JVM and requires an executable main method. -->
+  <suppress checks="UncommentedMain" files="SequentialSubscriptionJdiTest.java"/>
 </suppressions>
