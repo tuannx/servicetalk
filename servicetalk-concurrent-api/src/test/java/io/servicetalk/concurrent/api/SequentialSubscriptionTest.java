@@ -340,6 +340,52 @@ final class SequentialSubscriptionTest {
         assertThat("Unexpected cancel counts -> iterations: " + outcomes, outcomes.keySet(), is(empty()));
     }
 
+    @Test
+    void cancelDuringSwitchToCancelsNewSubscription() {
+        doAnswer(invocation -> {
+            s.cancel();
+            return null;
+        }).when(s2).request(anyLong());
+        s.request(1);
+        s.switchTo(s2);
+        verify(s1).request(1);
+        verify(s2).request(1);
+        verify(s2).cancel();
+        verifyNoMoreInteractions(s1, s2);
+    }
+
+    @Test
+    void cancelDuringSwitchToCancelsOnlyLatestSubscription() {
+        final Subscription s3 = mock(Subscription.class);
+        doAnswer(invocation -> {
+            s.switchTo(s3);
+            s.cancel();
+            return null;
+        }).when(s2).request(anyLong());
+        s.request(1);
+        s.switchTo(s2);
+        verify(s2).request(1);
+        verify(s3).cancel();
+        // s2 was replaced before cancel(), so it is not cancelled.
+        verifyNoMoreInteractions(s2, s3);
+    }
+
+    @Test
+    void invalidRequestDuringSwitchToReachesLatestSubscription() {
+        final Subscription s3 = mock(Subscription.class);
+        doAnswer(invocation -> {
+            s.request(-1);
+            s.switchTo(s3);
+            return null;
+        }).when(s2).request(anyLong());
+        s.request(1);
+        s.switchTo(s2);
+        verify(s2).request(1);
+        verify(s3).request(-1);
+        // s2 was replaced before the switch picked up the invalid request, so it does not receive it.
+        verifyNoMoreInteractions(s2, s3);
+    }
+
     private void testConcurrentRequestEmitAndSwitch(int totalItems, int maxDeliveryPerSubscription) throws Exception {
         final SequentialSubscription subscription = new SequentialSubscription();
         final CyclicBarrier allStarted = new CyclicBarrier(3);
