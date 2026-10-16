@@ -1,0 +1,259 @@
+name: Fork Redteam Advisory
+permissions:
+  contents: read
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main, 'codex/**' ]
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Base commit SHA
+        required: true
+      head:
+        description: Head commit SHA
+        required: true
+jobs:
+  advisory:
+    if: github.repository == 'tuannx/servicetalk'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha || inputs.base || github.event.before }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha || inputs.head || github.sha }}
+      PYTHONHASHSEED: '0'
+      TZ: UTC
+      LC_ALL: C
+      DISTRIBUTION_ALLOWED: ${{ github.actor == github.repository_owner && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    steps:
+      - name: Checkout reviewed head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.HEAD_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Record source and runtime environment
+        run: |
+          mkdir -p redteam-artifacts
+          if [ "$BASE_SHA" = '0000000000000000000000000000000000000000' ]; then
+            BASE_SHA=$(git merge-base "$HEAD_SHA" origin/main)
+            echo "BASE_SHA=$BASE_SHA" >> "$GITHUB_ENV"
+            echo 'created branch: merge-base with origin/main' > redteam-artifacts/base-source.txt
+          fi
+          python3 - "$BASE_SHA" "$HEAD_SHA" <<'PY'
+          import re
+          import sys
+          assert all(re.fullmatch('[0-9a-f]{40}', sha) for sha in sys.argv[1:]), 'full SHA required'
+          PY
+          git cat-file -e "$BASE_SHA^{commit}"
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$HEAD_SHA")" >> "$GITHUB_ENV"
+          date +%s.%N > redteam-artifacts/action-start.txt
+      - name: Check optional doctrine access
+        id: distribution
+        env:
+          REDTEAM_DOCTRINE_TOKEN: ${{ secrets.REDTEAM_DOCTRINE_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          authorized = os.environ['DISTRIBUTION_ALLOWED'] == 'true'
+          credential = bool(os.environ.get('REDTEAM_DOCTRINE_TOKEN'))
+          enabled = authorized and credential
+          record = {'repository': 'tuannx/redteam-doctrine',
+                    'toolSha': '0ee5a2e48f16c5e3274fceb1f6c390a10aaaedb2',
+                    'ownerControlledEvent': authorized, 'credentialPresent': credential,
+                    'gate': 'notRun', 'scores': None,
+                    'nextAction': 'Owner can configure REDTEAM_DOCTRINE_TOKEN with read-only repository access '
+                                  'or choose a public approved distribution.'}
+          Path('redteam-artifacts/distribution.json').write_text(json.dumps(record, indent=2) + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('enabled=' + str(enabled).lower() + '\n')
+          PY
+      - name: Checkout pinned doctrine source
+        id: source
+        if: steps.distribution.outputs.enabled == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: tuannx/redteam-doctrine
+          ref: 0ee5a2e48f16c5e3274fceb1f6c390a10aaaedb2
+          token: ${{ secrets.REDTEAM_DOCTRINE_TOKEN }}
+          path: .redteam-doctrine-runtime
+          persist-credentials: false
+      - name: Verify pinned doctrine source before execution
+        if: steps.distribution.outputs.enabled == 'true'
+        run: |
+          test "$(git -C .redteam-doctrine-runtime rev-parse HEAD)" = \
+            '0ee5a2e48f16c5e3274fceb1f6c390a10aaaedb2'
+      - name: Run pinned advisory adapter
+        id: gate
+        if: steps.distribution.outputs.enabled == 'true'
+        continue-on-error: true
+        uses: ./.redteam-doctrine-runtime
+        with:
+          base: ${{ env.BASE_SHA }}
+          head: ${{ env.HEAD_SHA }}
+          verdict-path: redteam-artifacts/verdict.json
+          comment: 'false'
+          python-version: '3.12.11'
+      - name: Verify range and measure repeatability
+        if: ${{ !cancelled() && steps.distribution.outputs.enabled == 'true' }}
+        env:
+          ADAPTER_OUTCOME: ${{ steps.gate.outcome }}
+        run: |
+          date +%s.%N > redteam-artifacts/action-end.txt
+          python3 - <<'PY'
+          import hashlib
+          import importlib.metadata
+          import json
+          import os
+          import subprocess
+          import sys
+          import time
+          from pathlib import Path
+          from pr_redteam.cli import _load_verdict
+          from pr_redteam.core import hash_normalized_verdict
+
+          root = Path('redteam-artifacts')
+          tool_sha = subprocess.check_output(['git', '-C', '.redteam-doctrine-runtime',
+                                               'rev-parse', 'HEAD'], text=True).strip()
+          assert tool_sha == '0ee5a2e48f16c5e3274fceb1f6c390a10aaaedb2', 'incorrect tool revision'
+          first = _load_verdict(str(root / 'verdict.json'))
+          expected = {'baseSha': os.environ['BASE_SHA'], 'headSha': os.environ['HEAD_SHA']}
+          assert first['pr'] == expected, 'incorrect reviewed range'
+          expected_outcome = 'failure' if first['verdict'] == 'block' else 'success'
+          assert os.environ['ADAPTER_OUTCOME'] == expected_outcome, 'adapter outcome contradicts verdict'
+          assert not first['routing']['selfMergeEligible'], 'advisory cannot authorize merging'
+          if first['counters']['protectedPathHits']:
+              assert first['routing']['maintainerReviewRequired'], 'protected change requires owner review'
+          start = time.perf_counter()
+          subprocess.run(['pr_redteam', 'run', '--repo', '.', '--base', expected['baseSha'],
+                          '--head', expected['headSha'], '--out', str(root / 'verdict-repeat.json')], check=True)
+          repeat_seconds = time.perf_counter() - start
+          second = _load_verdict(str(root / 'verdict-repeat.json'))
+          assert second['pr'] == expected, 'incorrect repeated range'
+          first_hash, second_hash = map(hash_normalized_verdict, (first, second))
+          assert first_hash == second_hash, 'non-deterministic verdict'
+          versions = {'python': sys.version, 'packages': dict(sorted(
+              (package.metadata['Name'], package.version) for package in importlib.metadata.distributions()))}
+          (root / 'versions.json').write_text(json.dumps(versions, indent=2, sort_keys=True) + '\n')
+          subprocess.run(['pr_redteam', 'render', '--verdict', str(root / 'verdict.json')],
+                         check=True, stdout=(root / 'rendered-verdict.md').open('w'))
+          score = {
+              'scope': 'advisory', 'doctrineMainSha': '61af48cd14c7b51b4220e5574500d0cffb8fd249',
+              'toolSha': '0ee5a2e48f16c5e3274fceb1f6c390a10aaaedb2', 'pr': expected,
+              'schemaValid': {'passed': 2, 'total': 2}, 'shaBinding': {'passed': 2, 'total': 2},
+              'repeatability': {'equalPairs': 1, 'totalPairs': 1, 'hash': first_hash},
+              'artifactSha256': hashlib.sha256((root / 'verdict.json').read_bytes()).hexdigest(),
+              'actionElapsedSeconds': float((root / 'action-end.txt').read_text()) -
+                                      float((root / 'action-start.txt').read_text()),
+              'repeatElapsedSeconds': repeat_seconds, 'adapterOutcome': os.environ['ADAPTER_OUTCOME'],
+              'verdict': first['verdict'], 'counters': first['counters'], 'checks': first['checks'],
+              'routing': first['routing'], 'actor': first['actor'],
+              'hostedRunId': os.environ['GITHUB_RUN_ID'], 'javaCorrectnessScore': None,
+              'notRun': ['signedPolicyVerification', 'runAttestation', 'JavaStaticChecker',
+                         'redGreenTestTruth', 'mutationTesting', 'claimMatching', 'architectureAnalysis'],
+          }
+          (root / 'score.json').write_text(json.dumps(score, indent=2, sort_keys=True) + '\n')
+          distribution = json.loads((root / 'distribution.json').read_text())
+          distribution.update({'gate': 'measured', 'scores': {
+              'schemaValid': score['schemaValid'], 'shaBinding': score['shaBinding'],
+              'repeatability': score['repeatability']}})
+          (root / 'distribution.json').write_text(json.dumps(distribution, indent=2) + '\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('Advisory artifact: schema 2/2; SHA binding 2/2; equal hashes 1/1.\n\n')
+              summary.write('Java correctness is not scored by this tool. Native tests are a separate job.\n')
+          PY
+      - name: Report unavailable doctrine access
+        if: ${{ !cancelled() && steps.distribution.outputs.enabled != 'true' }}
+        run: |
+          echo 'Advisory gate notRun: owner-controlled access to the private doctrine source is unavailable.'
+          echo 'See distribution.json; configure the optional read-only secret or choose an approved distribution.'
+          exit 1
+      - name: Upload advisory measurements
+        if: '!cancelled()'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: redteam-advisory-${{ github.run_id }}-${{ github.run_attempt }}
+          path: redteam-artifacts/
+  native:
+    if: github.repository == 'tuannx/servicetalk'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout reviewed head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || inputs.head || github.sha }}
+          persist-credentials: false
+      - name: Set up JDK 17
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          java-version: '17'
+          distribution: zulu
+          cache: gradle
+      - name: Run focused native tests
+        id: tests
+        continue-on-error: true
+        run: |
+          mkdir -p native-artifacts
+          rm -f native-artifacts/tests.log
+          rm -rf servicetalk-concurrent-api/build/test-results/test
+          java -version > native-artifacts/java-version.txt 2>&1
+          /usr/bin/time -p ./gradlew :servicetalk-concurrent-api:test --no-daemon --max-workers=2 \
+            --rerun-tasks --no-build-cache \
+            --tests io.servicetalk.concurrent.api.SequentialSubscriptionTest \
+            --tests io.servicetalk.concurrent.api.PublisherBufferConcurrencyTest \
+            > native-artifacts/tests.log 2> native-artifacts/test-runtime.txt
+      - name: Score native test results
+        if: '!cancelled()'
+        env:
+          TEST_OUTCOME: ${{ steps.tests.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          suites = []
+          test_log = Path('native-artifacts/tests.log')
+          test_task = '> Task :servicetalk-concurrent-api:test'
+          task_executed = os.environ['TEST_OUTCOME'] in ('success', 'failure') and test_log.exists()
+          task_executed = task_executed and any(
+              line in (test_task, test_task + ' FAILED') for line in test_log.read_text().splitlines())
+          files = sorted(Path('servicetalk-concurrent-api/build/test-results/test').glob('TEST-*.xml'))
+          for file in files if task_executed else []:
+              suite = ET.parse(file).getroot()
+              suites.append({**suite.attrib, 'failedCases': [case.attrib['name']
+                  for case in suite.findall('testcase') if case.find('failure') is not None]})
+          tests = sum(int(s['tests']) for s in suites)
+          failures = sum(int(s['failures']) for s in suites)
+          errors = sum(int(s['errors']) for s in suites)
+          skipped = sum(int(s['skipped']) for s in suites)
+          score = {'headSha': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+                   'tests': tests, 'failures': failures, 'errors': errors, 'skipped': skipped,
+                   'passed': tests - failures - errors - skipped, 'executed': tests - skipped, 'suites': suites,
+                   'outcome': os.environ['TEST_OUTCOME'], 'raceFreedomProven': False}
+          Path('native-artifacts/score.json').write_text(json.dumps(score, indent=2, sort_keys=True) + '\n')
+          assert tests - skipped > 0 and failures == 0 and errors == 0 and \
+              os.environ['TEST_OUTCOME'] == 'success', score
+          PY
+      - name: Run module quality checks
+        if: '!cancelled()'
+        run: |
+          /usr/bin/time -p ./gradlew :servicetalk-concurrent-api:quality --no-daemon --max-workers=2 \
+            --rerun-tasks --no-build-cache \
+            > native-artifacts/quality.log 2> native-artifacts/quality-runtime.txt
+      - name: Upload native measurements
+        if: '!cancelled()'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-concurrent-api-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            native-artifacts/
+            servicetalk-concurrent-api/build/test-results/test/TEST-*.xml
