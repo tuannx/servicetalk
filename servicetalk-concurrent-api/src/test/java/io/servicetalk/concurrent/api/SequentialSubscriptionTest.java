@@ -58,6 +58,8 @@ import static org.mockito.Mockito.verifyNoMoreInteractions;
 
 final class SequentialSubscriptionTest {
     private static final int ITERATIONS_FOR_CONCURRENT_TESTS = 500;
+    private static final int ITERATIONS_FOR_RACE_TESTS = 20_000;
+    private static final int EMIT_BATCH = 10;
     private SequentialSubscription s;
     private Subscription s1;
     private Subscription s2;
@@ -237,6 +239,36 @@ final class SequentialSubscriptionTest {
         }
     }
 
+    @Test
+    void switchToWhileAnotherSwitchUnwindsRequestsOutstandingDemandFromNewSubscription() throws Exception {
+        for (int i = 0; i < ITERATIONS_FOR_RACE_TESTS; ++i) {
+            switchToWhileAnotherSwitchUnwinds();
+        }
+    }
+
+    private void switchToWhileAnotherSwitchUnwinds() throws Exception {
+        final SequentialSubscription subscription = new SequentialSubscription();
+        subscription.switchTo(new CountingSubscription());
+        // The previous source terminated while EMIT_BATCH was outstanding.
+        subscription.request(EMIT_BATCH);
+        // The new source emits all of its items synchronously from request(n), and the downstream asks for more from
+        // inside onNext. When the source terminates, the redo operator subscribes again from another thread (e.g. when
+        // a timer fires) while switchTo(source) is still unwinding on this thread.
+        final EmittingSubscription source = new EmittingSubscription(subscription, 2 * EMIT_BATCH, EMIT_BATCH);
+        final CountingSubscription resubscribed = new CountingSubscription();
+        final Future<Void> resubscribe = executor.submit(() -> {
+            while (!source.isTerminated()) {
+                Thread.yield();
+            }
+            subscription.switchTo(resubscribed);
+            return null;
+        });
+        subscription.switchTo(source);
+        resubscribe.get();
+        assertThat("Demand that is outstanding after the last switch must be requested from the new subscription",
+                resubscribed.requestedReceived(), is((long) EMIT_BATCH));
+    }
+
     private void testConcurrentRequestEmitAndSwitch(int totalItems, int maxDeliveryPerSubscription) throws Exception {
         final SequentialSubscription subscription = new SequentialSubscription();
         final CyclicBarrier allStarted = new CyclicBarrier(3);
@@ -375,6 +407,58 @@ final class SequentialSubscriptionTest {
         @Override
         public String toString() {
             return "requestedReceived: " + requestedReceived.get() + " cancelled: " + cancelled;
+        }
+    }
+
+    /**
+     * Emits items synchronously from {@link #request(long)} like a {@link Publisher#range(int, int)} does.
+     */
+    private static final class EmittingSubscription implements Subscription {
+        private final SequentialSubscription subscription;
+        private final int totalItems;
+        private final int requestMoreEvery;
+        private long demand;
+        private int emitted;
+        private boolean emitting;
+        private volatile boolean terminated;
+
+        EmittingSubscription(final SequentialSubscription subscription, final int totalItems,
+                             final int requestMoreEvery) {
+            this.subscription = subscription;
+            this.totalItems = totalItems;
+            this.requestMoreEvery = requestMoreEvery;
+        }
+
+        @Override
+        public void request(final long n) {
+            demand += n;
+            if (emitting) {
+                return;
+            }
+            emitting = true;
+            try {
+                while (demand > 0 && emitted < totalItems) {
+                    --demand;
+                    ++emitted;
+                    subscription.itemReceived();
+                    if (emitted % requestMoreEvery == 0) {
+                        subscription.request(requestMoreEvery);
+                    }
+                }
+            } finally {
+                emitting = false;
+            }
+            if (emitted == totalItems) {
+                terminated = true;
+            }
+        }
+
+        @Override
+        public void cancel() {
+        }
+
+        boolean isTerminated() {
+            return terminated;
         }
     }
 
