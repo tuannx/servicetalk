@@ -1,5 +1,5 @@
 /*
- * Copyright © 2019 Apple Inc. and the ServiceTalk project authors
+ * Copyright © 2019-2026 Apple Inc. and the ServiceTalk project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,7 +31,9 @@ import java.util.List;
 import java.util.Map;
 import javax.annotation.Nullable;
 
+import static io.servicetalk.concurrent.internal.FlowControlUtils.addWithOverflowProtection;
 import static java.lang.Math.max;
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 
 /**
@@ -67,8 +69,10 @@ final class MinTtlCache implements DnsCache {
         if (minExpiry == null) {
             return initialTtl;
         } else {
-            final long minTtl = minExpiry - timeSource.currentTime(SECONDS);
-            return minTtl >= 0 ? minTtl : initialTtl;
+            // Track nanoseconds and round up: subtracting second-truncated timestamps under-reports the TTL by one
+            // second whenever a second boundary falls between caching and this read.
+            final long remainingNanos = minExpiry - timeSource.currentTime(NANOSECONDS);
+            return remainingNanos > 0 ? (remainingNanos + SECONDS.toNanos(1) - 1) / SECONDS.toNanos(1) : initialTtl;
         }
     }
 
@@ -102,8 +106,9 @@ final class MinTtlCache implements DnsCache {
     @Override
     public DnsCacheEntry cache(final String hostname, final DnsRecord[] additionals, final InetAddress address,
                                final long originalTtl, final EventLoop loop) {
-        final long currentTime = timeSource.currentTime(SECONDS);
-        minExpiryMap.merge(hostname, currentTime + max(initialTtl, originalTtl), Math::min);
+        final long expiryNanos = addWithOverflowProtection(timeSource.currentTime(NANOSECONDS),
+                SECONDS.toNanos(max(initialTtl, originalTtl)));
+        minExpiryMap.merge(hostname, expiryNanos, Math::min);
         return cache.cache(hostname, additionals, address, originalTtl, loop);
     }
 
