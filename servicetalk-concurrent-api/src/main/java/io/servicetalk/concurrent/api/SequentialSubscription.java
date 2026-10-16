@@ -1,5 +1,5 @@
 /*
- * Copyright © 2018-2019 Apple Inc. and the ServiceTalk project authors
+ * Copyright © 2018-2026 Apple Inc. and the ServiceTalk project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,8 @@ import io.servicetalk.concurrent.PublisherSource.Subscription;
 import io.servicetalk.concurrent.internal.FlowControlUtils;
 
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
+import javax.annotation.Nullable;
 
 import static io.servicetalk.concurrent.internal.EmptySubscriptions.EMPTY_SUBSCRIPTION_NO_THROW;
 import static io.servicetalk.concurrent.internal.SubscriberUtils.isRequestNValid;
@@ -46,11 +48,20 @@ final class SequentialSubscription implements Subscription {
             newUpdater(SequentialSubscription.class, "requested");
     private static final AtomicLongFieldUpdater<SequentialSubscription> sourceRequestedUpdater =
             newUpdater(SequentialSubscription.class, "sourceRequested");
+    private static final AtomicReferenceFieldUpdater<SequentialSubscription, Subscription> pendingUpdater =
+            AtomicReferenceFieldUpdater.newUpdater(SequentialSubscription.class, Subscription.class,
+                    "pendingSubscription");
 
     private Subscription subscription;
     private long sourceEmitted;
     private volatile long requested;
     private volatile long sourceRequested;
+    /**
+     * The latest {@link Subscription} passed to {@link #switchTo(Subscription)} that the switch owner has not yet
+     * picked up. Only the switch owner writes {@link #subscription}.
+     */
+    @Nullable
+    private volatile Subscription pendingSubscription;
 
     /**
      * New instance.
@@ -118,11 +129,12 @@ final class SequentialSubscription implements Subscription {
 
     @Override
     public void cancel() {
-        final Subscription currSubscription = subscription;
         final long currSourceRequested = sourceRequestedUpdater.getAndSet(this, CANCELLED);
         // To avoid concurrent invocation with the switch thread we defer to that thread to cancel.
         if (currSourceRequested >= 0) {
-            currSubscription.cancel();
+            // No switch was in progress, and none can start once cancelled. Reading the subscription after the
+            // getAndSet observes the latest completed switch.
+            subscription.cancel();
         }
     }
 
@@ -130,81 +142,106 @@ final class SequentialSubscription implements Subscription {
      * Switches <strong>current</strong> {@link Subscription} to {@code next}. It is assumed the {@link Subscriber}
      * associated with the previous {@link Subscription} will no longer call {@link #itemReceived()}.
      * <p>
-     * Only can be called in the {@link Subscriber} thread!
+     * Only can be called in the {@link Subscriber} thread! A request callback of the previous {@link Subscription} may
+     * still be unwinding on another thread; that thread then completes the switch to the latest {@code next}.
      * @param next {@link Subscription} that should now be <strong>current</strong>.
      */
     void switchTo(Subscription next) {
-        requireNonNull(next);
-        // No special concurrency considerations for sourceEmitted access is required in this method because we are
-        // on the Subscriber thread in this method. We want to track the effective source requested for the purposes of
-        // how much more request(n) is necessary below.
-        long effectiveSourceRequested = sourceEmitted;
+        // Publishing next also publishes sourceEmitted to the thread that owns the switch.
+        pendingSubscription = requireNonNull(next);
         for (;;) {
             final long currSourceRequested = sourceRequested;
             if (currSourceRequested == CANCELLED) {
-                final long currRequested = requested;
-                if (currRequested >= 0) {
-                    next.cancel();
-                } else { // invalid requestN is pending, deliver to each subscription.
-                    next.request(currRequested);
+                terminatePending();
+                break;
+            } else if (currSourceRequested < 0) {
+                assert currSourceRequested == SWITCHING || currSourceRequested == REQUESTED;
+                // A switch is in progress, either higher in this stack or on a thread still unwinding a request
+                // callback. Mark pending work so the owner picks up next before it finishes.
+                if (sourceRequestedUpdater.compareAndSet(this, currSourceRequested, REQUESTED)) {
+                    break;
                 }
-                break;
-            } else if (currSourceRequested == SWITCHING) {
-                // concurrency is not allowed on this method, but reentry is allowed. save next into subscription so
-                // we can use it when the stack unwinds to deliver demand to it.
-                subscription = next;
-                break;
             } else if (sourceRequestedUpdater.compareAndSet(this, currSourceRequested, SWITCHING)) {
-                assert currSourceRequested >= 0 || currSourceRequested == REQUESTED;
-                final long currRequested = requested;
-                if (currRequested < 0) { // invalid requestN is pending.
-                    sourceRequested = CANCELLED;
-                    next.request(currRequested);
-                    break;
-                }
-
-                // sourceEmitted is stable here because we are on the Subscriber thread. We want to request the
-                // difference between total requested and what has been emitted from the new subscription. We also
-                // need to set the value of total requested below to make sure it is monotonically increasing.
-                // effectiveSourceRequested ...[delta]... requested
-                final long delta = currRequested - effectiveSourceRequested;
-                assert delta >= 0;
-                final Subscription beforeSubscription = subscription;
-                if (delta != 0) {
-                    // There maybe concurrency with the Subscription thread, or synchronous delivery of data from
-                    // request(n). In these cases we want to avoid "double request" from requested, so we track how much
-                    // we have already requested and decrement it on future loop iterations.
-                    effectiveSourceRequested = currRequested;
-                    next.request(delta);
-                }
-
-                final boolean reentry = beforeSubscription != subscription;
-                if (reentry) {
-                    // subscription was overwritten higher in the stack to track the more recent value. overwrite next
-                    // in our current stack frame to use the more recent value on the next loop iteration.
-                    next = subscription;
-
-                    // There is a new subscription so we need to reset state for how much has been emitted, so we
-                    // deliver demand to the more recent subscription on the next loop iteration.
-                    effectiveSourceRequested = sourceEmitted;
-                } else {
-                    // Make the subscription visible before restoring the state of sourceRequested. If the Subscription
-                    // thread observes the sourceRequested change it will also observe the subscription change. The
-                    // Subscription thread also uses sourceRequested to make sure there is no concurrent invocation of
-                    // the switched Subscription.
-                    subscription = next;
-                }
-
-                // We want to set sourceRequested to currRequested because we have already requested the delta between
-                // the two above, and we want to ensure sourceRequested is always monotonically increasing
-                // (besides control values) to prevent the Subscription thread from requesting from an old subscription.
-                if (sourceRequestedUpdater.compareAndSet(this, SWITCHING, currRequested) && !reentry) {
-                    break;
-                }
-                // else the Subscription thread was active in the mean time, we need to process the pending event(s).
-                // if the state is cancelled the Subscription thread defers to this thread to do the cancel on the
-                // next loop invocation. or this method was invoked in a re-entry fashion and we need to loop again.
+                switchOwned(currSourceRequested);
+                break;
             }
+        }
+    }
+
+    /**
+     * Delivers demand to the latest pending {@link Subscription} until no more work is pending.
+     * <p>
+     * Only the thread which set {@link #sourceRequested} to {@link #SWITCHING} calls this method.
+     * @param prevSourceRequested the total requested from {@link #subscription} before the switch started.
+     */
+    private void switchOwned(long prevSourceRequested) {
+        Subscription current = subscription;
+        // How much has been requested from current, in terms of total requested.
+        long effectiveSourceRequested = prevSourceRequested;
+        for (;;) {
+            final Subscription next = pendingUpdater.getAndSet(this, null);
+            if (next != null) {
+                // The new source starts where the previous one stopped emitting.
+                current = next;
+                effectiveSourceRequested = sourceEmitted;
+            }
+            final long currRequested = requested;
+            if (currRequested < 0) { // invalid requestN is pending.
+                subscription = current;
+                sourceRequested = CANCELLED;
+                current.request(currRequested);
+                terminatePending();
+                return;
+            }
+
+            // effectiveSourceRequested ...[delta]... requested
+            final long delta = currRequested - effectiveSourceRequested;
+            assert delta >= 0;
+            if (delta != 0) {
+                // Commit before the callback, so reentrant or concurrent calls only add pending work.
+                effectiveSourceRequested = currRequested;
+                current.request(delta);
+            }
+            // Make the subscription visible before restoring the state of sourceRequested. If the Subscription thread
+            // observes the sourceRequested change it will also observe the subscription change.
+            subscription = current;
+            if (sourceRequestedUpdater.compareAndSet(this, SWITCHING, currRequested)) {
+                return;
+            }
+            // request(n) or switchTo(next) marked pending work, or cancel() deferred the cancel to this thread.
+            for (;;) {
+                final long currSourceRequested = sourceRequested;
+                if (currSourceRequested == CANCELLED) {
+                    // Only the latest subscription is terminated; a replaced one is not cancelled.
+                    final Subscription latest = pendingUpdater.getAndSet(this, null);
+                    terminate(latest == null ? current : latest);
+                    return;
+                }
+                assert currSourceRequested == REQUESTED;
+                if (sourceRequestedUpdater.compareAndSet(this, REQUESTED, SWITCHING)) {
+                    break;
+                }
+            }
+        }
+    }
+
+    /**
+     * Terminates the pending {@link Subscription}, if any, after {@link #sourceRequested} is {@link #CANCELLED}. The
+     * atomic take ensures each pending {@link Subscription} is terminated once.
+     */
+    private void terminatePending() {
+        final Subscription next = pendingUpdater.getAndSet(this, null);
+        if (next != null) {
+            terminate(next);
+        }
+    }
+
+    private void terminate(Subscription target) {
+        final long currRequested = requested;
+        if (currRequested >= 0) {
+            target.cancel();
+        } else { // invalid requestN is pending, deliver to each subscription.
+            target.request(currRequested);
         }
     }
 
