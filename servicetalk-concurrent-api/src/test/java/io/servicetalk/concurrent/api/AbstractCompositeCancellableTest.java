@@ -1,5 +1,5 @@
 /*
- * Copyright © 2020-2021 Apple Inc. and the ServiceTalk project authors
+ * Copyright © 2020-2026 Apple Inc. and the ServiceTalk project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,8 +25,11 @@ import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static io.servicetalk.concurrent.api.Single.collectUnordered;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.is;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 
@@ -60,23 +63,33 @@ public abstract class AbstractCompositeCancellableTest<T extends Cancellable> {
     void multiThreadedAddCancel() throws Exception {
         final int addThreads = 1000;
         final CyclicBarrier barrier = new CyclicBarrier(addThreads + 1);
-        final List<Single<Cancellable>> cancellableSingles = new ArrayList<>(addThreads);
+        final List<Single<CountingCancellable>> cancellableSingles = new ArrayList<>(addThreads);
         T dynamicCancellable = newCompositeCancellable();
         for (int i = 0; i < addThreads; ++i) {
             cancellableSingles.add(EXECUTOR_RULE.executor().submit(() -> {
-                Cancellable c = mock(Cancellable.class);
+                CountingCancellable c = new CountingCancellable();
                 barrier.await();
                 add(dynamicCancellable, c);
                 return c;
             }));
         }
 
-        Future<Collection<Cancellable>> future = collectUnordered(cancellableSingles, addThreads).toFuture();
+        Future<Collection<CountingCancellable>> future = collectUnordered(cancellableSingles, addThreads).toFuture();
         barrier.await();
         dynamicCancellable.cancel();
-        Collection<Cancellable> cancellables = future.get();
-        for (Cancellable c : cancellables) {
-            verify(c).cancel();
+        Collection<CountingCancellable> cancellables = future.get();
+        for (CountingCancellable c : cancellables) {
+            assertThat(c.cancelCount.get(), is(1));
+        }
+    }
+
+    // Not a Mockito mock: creating and verifying 1000 mocks on 1000 threads dominates the run time of this test.
+    private static final class CountingCancellable implements Cancellable {
+        final AtomicInteger cancelCount = new AtomicInteger();
+
+        @Override
+        public void cancel() {
+            cancelCount.incrementAndGet();
         }
     }
 }
