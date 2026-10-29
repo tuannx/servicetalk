@@ -1,0 +1,22 @@
+{
+  "revision": "a1bd0993b89ca66981b8ca364de23aa9ee387bcc",
+  "subjectSha256": "8867d7352d8464b41dd31a5ad9ed071f0bd6ed616879dc07d9f5ee4215ab9a39",
+  "testSha256": "a33f0002246c4e62f442a7ab203f33c8006662aef982bacba8dec5d13f2c0aaf",
+  "frayVersion": "0.9.0",
+  "javaVersion": "openjdk version \"25.0.1\" 2025-10-21 LTS\nOpenJDK Runtime Environment Corretto-25.0.1.8.1 (build 25.0.1+8-LTS)\nOpenJDK 64-Bit Server VM Corretto-25.0.1.8.1 (build 25.0.1+8-LTS, mixed mode, sharing)",
+  "mode": "explore",
+  "requestedIterations": 10000,
+  "reportedTotalIter": 10000,
+  "lastProgressIteration": 9000,
+  "errorIteration": null,
+  "exitCode": 0,
+  "junit": {
+    "tests": 1,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "failures": [],
+  "replayInputSha256": null,
+  "wallSeconds": 81.045918958
+}

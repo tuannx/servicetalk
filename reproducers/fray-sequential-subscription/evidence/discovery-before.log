@@ -1,0 +1,20 @@
+2026-10-29 12:06:59 [INFO]: Fray started.
+2026-10-29 12:07:01 [INFO]: Error found at iter: 63, step: 681, Elapsed time: 1601ms
+2026-10-29 12:07:01 [INFO]: Error: java.lang.AssertionError:
+Expected: is <2L>
+     but: was <0L>
+Thread: Thread[#287,Thread-192,5,main]
+java.lang.AssertionError:
+Expected: is <2L>
+     but: was <0L>
+	at org.hamcrest.MatcherAssert.assertThat(MatcherAssert.java:20)
+	at org.hamcrest.MatcherAssert.assertThat(MatcherAssert.java:6)
+	at io.servicetalk.concurrent.api.SequentialSubscriptionTest.switchToAfterSourceTerminationTransfersOutstandingDemand(SequentialSubscriptionTest.java:54)
+	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:104)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:565)
+	at org.pastalab.fray.core.command.MethodExecutor.execute(Executor.kt:66)
+	at org.pastalab.fray.core.TestRunner.run$lambda$0(TestRunner.kt:68)
+	at java.base/java.lang.Thread.run(Thread.java:1474)
+
+2026-10-29 12:07:01 [INFO]: The recording is saved to /private/tmp/servicetalk-fray-20261029/reproducers/fray-sequential-subscription/build/fray/fray-report/io.servicetalk.concurrent.api.SequentialSubscriptionTest/switchToAfterSourceTerminationTransfersOutstandingDemand/recording
+2026-10-29 12:07:01 [INFO]: Run finished. Total iter: 63, Elapsed time: 1679ms, Iterations/sec: 37.52, Covered timelines: 18
