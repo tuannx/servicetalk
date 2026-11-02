@@ -53,38 +53,67 @@ dependencies {
 }
 
 // --- Fray harness: opt-in controlled-concurrency tests (not part of the default build) ---
-// Fray's junit artifacts are compiled for Java 11+, while this module compiles tests with --release 8,
-// so Fray tests live in a dedicated source set compiled at release 21 and run by a dedicated task that
-// the Fray plugin configures. The default `test` source set and task are untouched.
-sourceSets {
-  frayTest {
-    java.srcDir 'src/frayTest/java'
-    compileClasspath += sourceSets.main.output + sourceSets.test.output + configurations.testCompileClasspath
-    runtimeClasspath += output + compileClasspath + configurations.testRuntimeClasspath
-  }
-}
-
-dependencies {
-  frayTestImplementation "org.pastalab.fray:fray-junit:0.9.2"
-}
-
-tasks.register('frayCheck', Test) {
-  description = 'Runs Fray controlled-concurrency tests.'
-  group = 'verification'
-  testClassesDirs = sourceSets.frayTest.output.classesDirs
-  classpath = sourceSets.frayTest.runtimeClasspath
-  useJUnitPlatform()
-}
-
-if (JavaVersion.current().isCompatibleWith(JavaVersion.VERSION_11)) {
+// Enable with -Pfray.enabled=true; without the property this block is inert and the build is
+// exactly as before. Fray's artifacts require JVM 11+ while this module compiles tests with
+// --release 8, so Fray tests live in a dedicated source set compiled at release 21 and the
+// plugin (applied only in this block) is pointed at a dedicated task for that source set.
+if (project.hasProperty("fray.enabled") &&
+    JavaVersion.current().isCompatibleWith(JavaVersion.VERSION_11)) {
   apply plugin: "org.pastalab.fray.gradle"
+
+  sourceSets {
+    frayTest {
+      java.srcDir 'src/frayTest/java'
+      compileClasspath += sourceSets.main.output + sourceSets.test.output + configurations.testCompileClasspath
+      runtimeClasspath += output + compileClasspath + configurations.testRuntimeClasspath
+    }
+  }
+
+  dependencies {
+    frayTestImplementation "org.pastalab.fray:fray-junit:0.9.2"
+    frayTestImplementation "org.pastalab.fray:fray-core:0.9.2"
+    frayTestImplementation "org.pastalab.fray:fray-runtime:0.9.2"
+    frayTestImplementation "org.pastalab.fray.instrumentation:fray-instrumentation-agent:0.9.2"
+    frayTestImplementation "org.pastalab.fray:fray-jvmti-linux-x8664:0.9.2"
+  }
+
+  configurations {
+    frayTestCompileClasspath {
+      attributes {
+        attribute(org.gradle.api.attributes.java.TargetJvmVersion.TARGET_JVM_VERSION_ATTRIBUTE, 21)
+      }
+    }
+    frayTestRuntimeClasspath {
+      attributes {
+        attribute(org.gradle.api.attributes.java.TargetJvmVersion.TARGET_JVM_VERSION_ATTRIBUTE, 21)
+      }
+    }
+  }
+
+  tasks.register('frayCheck', Test) {
+    description = 'Runs Fray controlled-concurrency tests.'
+    group = 'verification'
+    testClassesDirs = sourceSets.frayTest.output.classesDirs
+    classpath = sourceSets.frayTest.runtimeClasspath
+    useJUnitPlatform()
+  }
+
   fray {
     testTask = "frayCheck"
   }
-}
 
-afterEvaluate {
-  tasks.named('compileFrayTestJava') {
-    options.release = 21
+  afterEvaluate {
+    tasks.named('compileFrayTestJava') {
+      options.release = 21
+    }
+    // The Fray plugin also injects its artifacts into the standard test configurations.
+    // They cannot resolve against this module's JVM 8 test classpath, so keep them only
+    // in the frayTest configurations above.
+    configurations.testImplementation.dependencies.removeAll {
+      it.group != null && it.group.startsWith('org.pastalab.fray')
+    }
+    configurations.testCompileOnly.dependencies.removeAll {
+      it.group != null && it.group.startsWith('org.pastalab.fray')
+    }
   }
 }
