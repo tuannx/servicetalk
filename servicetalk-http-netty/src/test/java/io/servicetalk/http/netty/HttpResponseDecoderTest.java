@@ -1,5 +1,5 @@
 /*
- * Copyright © 2018, 2020, 2021 Apple Inc. and the ServiceTalk project authors
+ * Copyright © 2018-2026 Apple Inc. and the ServiceTalk project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,10 +40,16 @@ import io.servicetalk.http.api.HttpResponseMetaData;
 import io.servicetalk.http.api.HttpResponseStatus;
 import io.servicetalk.http.netty.HttpResponseDecoder.Signal;
 import io.servicetalk.transport.netty.internal.CloseHandler;
+import io.servicetalk.transport.netty.internal.DefaultNettyConnection.CancelWriteUserEvent;
+import io.servicetalk.transport.netty.internal.DefaultNettyConnection.ContinueUserEvent;
 import io.servicetalk.utils.internal.IllegalCharacterException;
 
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.handler.codec.DecoderException;
+import io.netty.util.AttributeKey;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -52,6 +58,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Queue;
 
@@ -60,12 +67,18 @@ import static io.servicetalk.buffer.netty.BufferAllocators.DEFAULT_ALLOCATOR;
 import static io.servicetalk.buffer.netty.BufferUtils.getByteBufAllocator;
 import static io.servicetalk.http.api.HeaderUtils.isTransferEncodingChunked;
 import static io.servicetalk.http.api.HttpHeaderNames.CONTENT_LENGTH;
+import static io.servicetalk.http.api.HttpHeaderNames.EXPECT;
 import static io.servicetalk.http.api.HttpHeaderNames.HOST;
 import static io.servicetalk.http.api.HttpHeaderNames.TRANSFER_ENCODING;
 import static io.servicetalk.http.api.HttpHeaderValues.CHUNKED;
+import static io.servicetalk.http.api.HttpHeaderValues.CONTINUE;
+import static io.servicetalk.http.api.HttpHeaderValues.ZERO;
 import static io.servicetalk.http.api.HttpProtocolVersion.HTTP_1_1;
+import static io.servicetalk.http.api.HttpRequestMetaDataFactory.newRequestMetaData;
 import static io.servicetalk.http.api.HttpRequestMethod.CONNECT;
+import static io.servicetalk.http.api.HttpRequestMethod.POST;
 import static io.servicetalk.http.api.HttpResponseStatus.BAD_REQUEST;
+import static io.servicetalk.http.api.HttpResponseStatus.EXPECTATION_FAILED;
 import static io.servicetalk.http.api.HttpResponseStatus.NO_CONTENT;
 import static io.servicetalk.http.api.HttpResponseStatus.OK;
 import static io.servicetalk.http.netty.H1ProtocolConfigBuilder.DEFAULT_MAX_HEADER_FIELD_LENGTH;
@@ -75,7 +88,9 @@ import static io.servicetalk.http.netty.HttpResponseDecoder.Signal.REQUEST_SIGNA
 import static io.servicetalk.transport.netty.internal.CloseHandler.UNSUPPORTED_PROTOCOL_CLOSE_HANDLER;
 import static java.lang.Integer.toHexString;
 import static java.nio.charset.StandardCharsets.US_ASCII;
+import static java.time.Duration.ofDays;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.instanceOf;
@@ -87,27 +102,47 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class HttpResponseDecoderTest extends HttpObjectDecoderTest {
 
-    private static final class PollLikePeakArrayDeque<T> extends ArrayDeque<T> {
-        private static final long serialVersionUID = -8160337336374186819L;
+    private static final String CONTINUE_RESPONSE = "HTTP/1.1 100 Continue\r\n\r\n";
+    private static final String OK_RESPONSE = "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
+    private static final String NO_OUTSTANDING_REQUEST = "Received data on a connection without an outstanding request";
+    private static final String TIMEOUT_RESPONSE = "HTTP/1.1 408 Request Timeout\r\ncontent-length: 0\r\n\r\n";
+    private static final String EXPECTATION_FAILED_RESPONSE =
+            "HTTP/1.1 417 Expectation Failed\r\ncontent-length: 0\r\n\r\n";
 
-        @Override
-        public T poll() {
-            return peek();  // Prevent taking an element out of the queue to allow reuse for multiple tests
-        }
+    private static final AttributeKey<Runnable> SEND_REQUEST = AttributeKey.valueOf("sendRequest");
+
+    private final List<Object> userEvents = new ArrayList<>();
+    // Queues shared by the encoder and decoder of newClientChannel()
+    private final Queue<HttpRequestMethod> clientMethodQueue = new ArrayDeque<>();
+    private final Deque<Signal> clientSignalsQueue = new ArrayDeque<>();
+
+    private final EmbeddedChannel channel = newChannel(false, false);
+    private final EmbeddedChannel channelSpecException = newChannel(true, false);
+
+    private static EmbeddedChannel newChannel(boolean allowLFWithoutCR, boolean allowHeaderWithoutColon) {
+        return newChannel(POST, DEFAULT_MAX_TOTAL_HEADER_FIELDS_LENGTH, allowLFWithoutCR, allowHeaderWithoutColon,
+                UNSUPPORTED_PROTOCOL_CLOSE_HANDLER);
     }
 
-    private final Queue<HttpRequestMethod> methodQueue = new ArrayDeque<>();
-
-    private final EmbeddedChannel channel = newChannel(false);
-    private final EmbeddedChannel channelSpecException = newChannel(true);
-
-    private EmbeddedChannel newChannel(boolean allowLFWithoutCR) {
-        final Deque<Signal> signalsQueue = new PollLikePeakArrayDeque<>();
-        signalsQueue.offer(REQUEST_SIGNAL);
-        return new EmbeddedChannel(new HttpResponseDecoder(methodQueue, signalsQueue,
+    /**
+     * Creates a channel with one outstanding request, so the decoder accepts exactly one final response.
+     */
+    private static EmbeddedChannel newChannel(HttpRequestMethod requestMethod, int maxTotalHeaderFieldsLength,
+                                              boolean allowLFWithoutCR, boolean allowHeaderWithoutColon,
+                                              CloseHandler closeHandler) {
+        final Queue<HttpRequestMethod> methodQueue = new ArrayDeque<>();
+        final Deque<Signal> signalsQueue = new ArrayDeque<>();
+        final Runnable sendRequest = () -> {
+            methodQueue.add(requestMethod);
+            signalsQueue.add(REQUEST_SIGNAL);
+        };
+        sendRequest.run();
+        final EmbeddedChannel channel = new EmbeddedChannel(new HttpResponseDecoder(methodQueue, signalsQueue,
                 getByteBufAllocator(DEFAULT_ALLOCATOR), DefaultHttpHeadersFactory.INSTANCE,
-                DEFAULT_MAX_START_LINE_LENGTH, DEFAULT_MAX_HEADER_FIELD_LENGTH, DEFAULT_MAX_TOTAL_HEADER_FIELDS_LENGTH,
-                false, allowLFWithoutCR, UNSUPPORTED_PROTOCOL_CLOSE_HANDLER));
+                DEFAULT_MAX_START_LINE_LENGTH, DEFAULT_MAX_HEADER_FIELD_LENGTH, maxTotalHeaderFieldsLength,
+                false, allowLFWithoutCR, allowHeaderWithoutColon, closeHandler));
+        channel.attr(SEND_REQUEST).set(sendRequest);
+        return channel;
     }
 
     @Override
@@ -118,6 +153,23 @@ class HttpResponseDecoderTest extends HttpObjectDecoderTest {
     @Override
     EmbeddedChannel channelSpecException() {
         return channelSpecException;
+    }
+
+    @Override
+    EmbeddedChannel channelAllowHeaderWithoutColon(boolean crlf) {
+        return newChannel(!crlf, true);
+    }
+
+    @Override
+    void beforeNextMessage(EmbeddedChannel channel) {
+        channel.attr(SEND_REQUEST).get().run();
+    }
+
+    @AfterEach
+    void clientQueuesAreEmpty() {
+        // Every request written by newClientChannel() must be matched with exactly one final response.
+        assertThat(clientMethodQueue, is(empty()));
+        assertThat(clientSignalsQueue, is(empty()));
     }
 
     @Override
@@ -152,27 +204,12 @@ class HttpResponseDecoderTest extends HttpObjectDecoderTest {
 
     @Override
     EmbeddedChannel channelWithMaxTotalHeaderFieldsLength(int maxTotalHeaderFieldsLength) {
-        final Deque<Signal> signalsQueue = new PollLikePeakArrayDeque<>();
-        signalsQueue.offer(REQUEST_SIGNAL);
-        return new EmbeddedChannel(new HttpResponseDecoder(methodQueue, signalsQueue,
-                getByteBufAllocator(DEFAULT_ALLOCATOR),
-                DefaultHttpHeadersFactory.INSTANCE,
-                DEFAULT_MAX_START_LINE_LENGTH,
-                DEFAULT_MAX_HEADER_FIELD_LENGTH,
-                maxTotalHeaderFieldsLength,
-                false,  // allowPrematureClosureBeforePayloadBody
-                false,  // allowLFWithoutCR
-                UNSUPPORTED_PROTOCOL_CLOSE_HANDLER));
+        return newChannel(POST, maxTotalHeaderFieldsLength, false, false, UNSUPPORTED_PROTOCOL_CLOSE_HANDLER);
     }
 
     @Override
     EmbeddedChannel channelWithCloseHandler(CloseHandler closeHandler) {
-        final Deque<Signal> signalsQueue = new PollLikePeakArrayDeque<>();
-        signalsQueue.offer(REQUEST_SIGNAL);
-        return new EmbeddedChannel(new HttpResponseDecoder(methodQueue, signalsQueue,
-                getByteBufAllocator(DEFAULT_ALLOCATOR), DefaultHttpHeadersFactory.INSTANCE,
-                DEFAULT_MAX_START_LINE_LENGTH, DEFAULT_MAX_HEADER_FIELD_LENGTH, DEFAULT_MAX_TOTAL_HEADER_FIELDS_LENGTH,
-                false, false, closeHandler));
+        return newChannel(POST, DEFAULT_MAX_TOTAL_HEADER_FIELDS_LENGTH, false, false, closeHandler);
     }
 
     @Test
@@ -369,6 +406,22 @@ class HttpResponseDecoderTest extends HttpObjectDecoderTest {
     }
 
     @Test
+    void multipleHostHeadersAllowedInResponse() {
+        writeMsg("HTTP/1.1 200 OK" + "\r\n" +
+                "Host: a.servicetalk.io" + "\r\n" +
+                "Host: b.servicetalk.io" + "\r\n" +
+                "Content-Length: 0" + "\r\n" + "\r\n");
+
+        HttpMetaData metaData = assertStartLineForContent();
+        Iterator<? extends CharSequence> hosts = metaData.headers().valuesIterator(HOST);
+        assertThat(hosts.next().toString(), is("a.servicetalk.io"));
+        assertThat(hosts.next().toString(), is("b.servicetalk.io"));
+        assertFalse(hosts.hasNext());
+        assertEmptyTrailers(channel());
+        assertFalse(channel().finishAndReleaseAll());
+    }
+
+    @Test
     void variableWithContent() {
         int contentLength = 128;
         writeMsg("HTTP/1.1 200 OK" + "\r\n" +
@@ -483,57 +536,205 @@ class HttpResponseDecoderTest extends HttpObjectDecoderTest {
 
     @Test
     void successfulResponseToConnectRequest() {
-        methodQueue.add(CONNECT);
+        EmbeddedChannel channel = newConnectChannel();
         writeMsg(startLineForContent() + "\r\n" +
                 "Host: servicetalk.io" + "\r\n" +
-                "Connection: keep-alive" + "\r\n\r\n");
+                "Connection: keep-alive" + "\r\n\r\n", channel);
 
-        assertStartLineForContent();
+        assertStartLineForContent(channel);
         assertEmptyTrailers(channel);
         assertFalse(channel.finishAndReleaseAll());
     }
 
     @Test
     void successfulResponseToConnectRequestWithPayloadBodyFails() {
-        methodQueue.add(CONNECT);
+        EmbeddedChannel channel = newConnectChannel();
         String content = "content";
         writeMsg(startLineForContent() + "\r\n" +
                 "Host: servicetalk.io" + "\r\n" +
                 "Content-Length: " + content.length() + "\r\n" +
-                "Connection: keep-alive" + "\r\n\r\n");
+                "Connection: keep-alive" + "\r\n\r\n", channel);
 
         // Verify response meta-data received and parsed as a full response:
-        assertStartLineForContent();
+        assertStartLineForContent(channel);
         assertEmptyTrailers(channel);
 
-        // Try to write response content:
-        assertDecoderException(content, "Invalid start-line");
+        // Try to write response content, it's parsed as the next response:
+        beforeNextMessage(channel);
+        assertDecoderException(content, "Invalid start-line", channel);
     }
 
     @Test
     void errorResponseToConnectRequestWithEmptyContent() {
-        methodQueue.add(CONNECT);
+        EmbeddedChannel channel = newConnectChannel();
         writeMsg("HTTP/1.1 400 Bad Request" + "\r\n" +
                 "Host: servicetalk.io" + "\r\n" +
                 "Content-Length: 0" + "\r\n" +
-                "Connection: keep-alive" + "\r\n\r\n");
-        assertResponseLine(HTTP_1_1, BAD_REQUEST);
+                "Connection: keep-alive" + "\r\n\r\n", channel);
+        assertResponseLine(HTTP_1_1, BAD_REQUEST, channel);
         assertEmptyTrailers(channel);
         assertFalse(channel.finishAndReleaseAll());
     }
 
     @Test
     void errorResponseToConnectRequestWithContent() {
-        methodQueue.add(CONNECT);
+        EmbeddedChannel channel = newConnectChannel();
         int contentLength = 128;
         writeMsg("HTTP/1.1 400 Bad Request" + "\r\n" +
                 "Host: servicetalk.io" + "\r\n" +
                 "Content-Length: " + contentLength + "\r\n" +
-                "Connection: keep-alive" + "\r\n\r\n");
-        writeContent(contentLength);
-        assertResponseLine(HTTP_1_1, BAD_REQUEST);
-        HttpHeaders trailers = assertPayloadSize(contentLength);
+                "Connection: keep-alive" + "\r\n\r\n", channel);
+        writeContent(contentLength, channel);
+        assertResponseLine(HTTP_1_1, BAD_REQUEST, channel);
+        HttpHeaders trailers = assertPayloadSize(contentLength, channel);
         assertThat("Trailers are not empty", trailers, nullValue());
         assertFalse(channel.finishAndReleaseAll());
+    }
+
+    @ParameterizedTest(name = "{displayName} [{index}] interimStatus={0}")
+    @ValueSource(strings = {"102 Processing", "103 Early Hints"})
+    void interimResponseBeforeContinueKeepsExpectContinueEntry(String interimStatus) {
+        EmbeddedChannel channel = newClientChannel();
+        writeRequest(channel, true);
+        writeResponse(channel, "HTTP/1.1 " + interimStatus + "\r\n\r\n");
+        assertThat(userEvents, is(empty()));
+        writeResponse(channel, CONTINUE_RESPONSE);
+        assertThat(userEvents, contains(ContinueUserEvent.INSTANCE));
+        writeResponse(channel, OK_RESPONSE);
+        assertThat(userEvents, contains(ContinueUserEvent.INSTANCE));
+        assertResponseLine(HTTP_1_1, OK, channel);
+        assertEmptyTrailers(channel);
+        assertFalse(channel.finishAndReleaseAll());
+    }
+
+    @Test
+    void duplicateContinueFiresOneEvent() {
+        EmbeddedChannel channel = newClientChannel();
+        writeRequest(channel, true);
+        writeResponse(channel, CONTINUE_RESPONSE);
+        writeResponse(channel, CONTINUE_RESPONSE);
+        writeResponse(channel, OK_RESPONSE);
+        assertThat(userEvents, contains(ContinueUserEvent.INSTANCE));
+        assertResponseLine(HTTP_1_1, OK, channel);
+        assertEmptyTrailers(channel);
+        assertFalse(channel.finishAndReleaseAll());
+    }
+
+    @Test
+    void continueAndFinalResponseInOneReadFireOneEvent() {
+        EmbeddedChannel channel = newClientChannel();
+        writeRequest(channel, true);
+        writeResponse(channel, CONTINUE_RESPONSE + OK_RESPONSE);
+        assertThat(userEvents, contains(ContinueUserEvent.INSTANCE));
+        assertResponseLine(HTTP_1_1, OK, channel);
+        assertEmptyTrailers(channel);
+        assertFalse(channel.finishAndReleaseAll());
+    }
+
+    @Test
+    void successfulFinalResponseWithoutContinueFiresContinue() {
+        EmbeddedChannel channel = newClientChannel();
+        writeRequest(channel, true);
+        writeResponse(channel, OK_RESPONSE);
+        assertThat(userEvents, contains(ContinueUserEvent.INSTANCE));
+        assertResponseLine(HTTP_1_1, OK, channel);
+        assertEmptyTrailers(channel);
+        assertFalse(channel.finishAndReleaseAll());
+    }
+
+    @Test
+    void unsuccessfulFinalResponseWithoutContinueFiresCancelWrite() {
+        EmbeddedChannel channel = newClientChannel();
+        writeRequest(channel, true);
+        writeResponse(channel, EXPECTATION_FAILED_RESPONSE);
+        assertThat(userEvents, contains(CancelWriteUserEvent.INSTANCE));
+        assertResponseLine(HTTP_1_1, EXPECTATION_FAILED, channel);
+        assertEmptyTrailers(channel);
+        assertFalse(channel.finishAndReleaseAll());
+    }
+
+    @Test
+    void continueWithoutRequestFails() {
+        EmbeddedChannel channel = newClientChannel();
+        assertDecoderException(CONTINUE_RESPONSE, NO_OUTSTANDING_REQUEST, channel);
+        assertThat(userEvents, is(empty()));
+    }
+
+    @Test
+    void continueForPlainRequestDoesNotReleasePipelinedRequest() {
+        EmbeddedChannel channel = newClientChannel();
+        writeRequest(channel, false);
+        writeRequest(channel, true);
+        writeResponse(channel, CONTINUE_RESPONSE);
+        writeResponse(channel, OK_RESPONSE);
+        assertThat(userEvents, is(empty()));
+        assertResponseLine(HTTP_1_1, OK, channel);
+        assertEmptyTrailers(channel);
+
+        writeResponse(channel, CONTINUE_RESPONSE);
+        assertThat(userEvents, contains(ContinueUserEvent.INSTANCE));
+        writeResponse(channel, OK_RESPONSE);
+        assertThat(userEvents, contains(ContinueUserEvent.INSTANCE));
+        assertResponseLine(HTTP_1_1, OK, channel);
+        assertEmptyTrailers(channel);
+        assertFalse(channel.finishAndReleaseAll());
+    }
+
+    @Test
+    void finalResponseWithoutRequestFails() {
+        EmbeddedChannel channel = newClientChannel();
+        assertDecoderException(TIMEOUT_RESPONSE, NO_OUTSTANDING_REQUEST, channel);
+    }
+
+    @Test
+    void partialStartLineWithoutRequestFails() {
+        EmbeddedChannel channel = newClientChannel();
+        assertDecoderException("\r\nHTTP/1.1 408 Req", NO_OUTSTANDING_REQUEST, channel);
+    }
+
+    @Test
+    void secondFinalResponseForOneRequestFails() {
+        EmbeddedChannel channel = newClientChannel();
+        writeRequest(channel, false);
+        writeResponse(channel, OK_RESPONSE);
+        assertResponseLine(HTTP_1_1, OK, channel);
+        assertEmptyTrailers(channel);
+
+        assertDecoderException(TIMEOUT_RESPONSE, NO_OUTSTANDING_REQUEST, channel);
+    }
+
+    private static EmbeddedChannel newConnectChannel() {
+        return newChannel(CONNECT, DEFAULT_MAX_TOTAL_HEADER_FIELDS_LENGTH, false, false,
+                UNSUPPORTED_PROTOCOL_CLOSE_HANDLER);
+    }
+
+    private EmbeddedChannel newClientChannel() {
+        return new EmbeddedChannel(new HttpResponseDecoder(clientMethodQueue, clientSignalsQueue,
+                getByteBufAllocator(DEFAULT_ALLOCATOR), DefaultHttpHeadersFactory.INSTANCE,
+                DEFAULT_MAX_START_LINE_LENGTH, DEFAULT_MAX_HEADER_FIELD_LENGTH, DEFAULT_MAX_TOTAL_HEADER_FIELDS_LENGTH,
+                false, false, false, UNSUPPORTED_PROTOCOL_CLOSE_HANDLER),
+                new HttpRequestEncoder(clientMethodQueue, clientSignalsQueue, 256, 256,
+                        UNSUPPORTED_PROTOCOL_CLOSE_HANDLER, ofDays(1)),
+                new ChannelInboundHandlerAdapter() {
+                    @Override
+                    public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {
+                        if (evt == ContinueUserEvent.INSTANCE || evt == CancelWriteUserEvent.INSTANCE) {
+                            userEvents.add(evt);
+                        }
+                    }
+                });
+    }
+
+    private static void writeRequest(EmbeddedChannel channel, boolean expectContinue) {
+        HttpHeaders headers = DefaultHttpHeadersFactory.INSTANCE.newHeaders().set(CONTENT_LENGTH, ZERO);
+        if (expectContinue) {
+            headers.set(EXPECT, CONTINUE);
+        }
+        assertThat(channel.writeOutbound(newRequestMetaData(HTTP_1_1, POST, "/", headers)), is(true));
+        assertThat(channel.releaseOutbound(), is(true));
+    }
+
+    private static void writeResponse(EmbeddedChannel channel, String response) {
+        channel.writeInbound(wrappedBuffer(response.getBytes(US_ASCII)));
     }
 }

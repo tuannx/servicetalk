@@ -1,5 +1,5 @@
 /*
- * Copyright © 2018 Apple Inc. and the ServiceTalk project authors
+ * Copyright © 2018-2026 Apple Inc. and the ServiceTalk project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -344,6 +344,46 @@ class WriteStreamSubscriberTest extends AbstractWriteTest {
         subscriber.onComplete();
         verifyListenerSuccessful();
         verifyNoMoreInteractions(subscription, closeHandler);
+    }
+
+    @Test
+    void clientChannelWritableWhileAwaitingContinuationDoesNotRequestMore() {
+        when(demandEstimator.estimateRequestN(anyLong())).thenReturn(10L);
+        subscriber = new WriteStreamSubscriber(channel, demandEstimator, completableSubscriber, closeHandler,
+                NoopWriteObserver.INSTANCE, identity(), true, __ -> true);
+        subscriber.onSubscribe(subscription);
+
+        verify(subscription).request(1L);
+        writeAndFlush("Hello1");
+        subscriber.channelWritable();
+        verifyNoMoreInteractions(subscription);
+
+        subscriber.continueWriting();
+        verify(subscription).request(10L);
+        subscriber.channelWritable();
+        verify(subscription, times(2)).request(10L);
+        writeAndFlush("Hello2");
+
+        verifyWriteSuccessful("Hello1", "Hello2");
+        subscriber.onComplete();
+        verifyListenerSuccessful();
+        verifyNoMoreInteractions(subscription, closeHandler);
+    }
+
+    @Test
+    void clientChannelWritableBeforeMetaDataDoesNotRequestMore() {
+        subscriber = new WriteStreamSubscriber(channel, demandEstimator, completableSubscriber, closeHandler,
+                NoopWriteObserver.INSTANCE, identity(), true, "Hello1"::equals);
+        subscriber.onSubscribe(subscription);
+        verify(subscription).request(1L);
+
+        // The channel becomes writable before the publisher delivers the meta-data.
+        subscriber.channelWritable();
+        verifyNoMoreInteractions(subscription);
+
+        writeAndFlush("Hello1");
+        verifyWriteSuccessful("Hello1");
+        verifyNoMoreInteractions(subscription);
     }
 
     @Test

@@ -1,5 +1,5 @@
 /*
- * Copyright © 2018, 2020 Apple Inc. and the ServiceTalk project authors
+ * Copyright © 2018-2026 Apple Inc. and the ServiceTalk project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -60,7 +60,8 @@ import static java.util.Objects.requireNonNull;
  * <ul>
  *     <li>When {@link #onSubscribe(Subscription)} is called.</li>
  *     <li>When a write completes successfully.</li>
- *     <li>When {@link #channelWritable()} is invoked.</li>
+ *     <li>When {@link #channelWritable()} is invoked, unless a client request awaits continuation.</li>
+ *     <li>When {@link #continueWriting()} is invoked.</li>
  * </ul>
  *
  * When there is a need for requesting more items, it tries to determine the capacity in netty's write buffer
@@ -113,6 +114,10 @@ final class WriteStreamSubscriber implements PublisherSource.Subscriber<Object>,
     private final boolean isClient;
     private final Predicate<Object> shouldWait;
     private boolean shouldWaitFlag;
+    /**
+     * Client requested the meta-data. Accessed only from the event loop.
+     */
+    private boolean metaDataRequested;
 
     WriteStreamSubscriber(Channel channel, WriteDemandEstimator demandEstimator, Subscriber subscriber,
                           CloseHandler closeHandler, WriteObserver observer,
@@ -221,7 +226,8 @@ final class WriteStreamSubscriber implements PublisherSource.Subscriber<Object>,
         if (isClient && subscription != null && subscription != CANCELLED && !promise.written) {
             // If nothing was written, make initial requestN
             initialRequestN(subscription);
-        } else {
+        } else if (!shouldWaitFlag) {
+            // Requests that await continuation request more only after continueWriting()
             requestMoreIfRequired(subscription, -1L);
         }
     }
@@ -316,8 +322,11 @@ final class WriteStreamSubscriber implements PublisherSource.Subscriber<Object>,
 
     private void initialRequestN(Subscription subscription) {
         if (isClient) {
-            if (promise.isWritable()) {
-                subscription.request(1L);   // Request meta-data only
+            // Request meta-data only, once. Both onSubscribe and channelWritable may get here before the first write,
+            // and more demand would let the payload body out before the meta-data is written.
+            if (!metaDataRequested && promise.isWritable()) {
+                metaDataRequested = true;
+                subscription.request(1L);
             }
         } else {
             requestMoreIfRequired(subscription, -1L);

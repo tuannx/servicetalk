@@ -1,5 +1,5 @@
 /*
- * Copyright © 2025 Apple Inc. and the ServiceTalk project authors
+ * Copyright © 2025-2026 Apple Inc. and the ServiceTalk project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,7 +20,6 @@ import io.servicetalk.buffer.api.BufferAllocator;
 import io.servicetalk.concurrent.api.Publisher;
 import io.servicetalk.concurrent.api.TestPublisher;
 import io.servicetalk.http.api.HttpClient;
-import io.servicetalk.http.api.HttpConnection;
 import io.servicetalk.http.api.HttpResponse;
 import io.servicetalk.http.api.HttpServerContext;
 import io.servicetalk.http.api.StreamingHttpClient;
@@ -53,6 +52,7 @@ import static io.servicetalk.http.netty.BuilderUtils.newServerBuilder;
 import static io.servicetalk.http.netty.HttpProtocol.HTTP_1;
 import static java.lang.String.valueOf;
 import static java.nio.charset.StandardCharsets.US_ASCII;
+import static java.time.Duration.ofMinutes;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.instanceOf;
@@ -165,9 +165,12 @@ class PayloadSizeLimitingHttpServiceFilterTest {
     @Test
     void expectContinueWithOversizedContentLengthRejectsWithoutSendingBody() throws Exception {
         // Filter must fail without subscribing to the body so the client never receives 100 Continue.
-        // Connection survives because the body was never sent.
+        // The connection is closed because HTTP/1.1 can not skip the declared body that was never sent.
         try (HttpServerContext server = startServer(HTTP_1);
-             StreamingHttpClient client = newClient(server, HTTP_1);
+             // A long timeout keeps the client timer from subscribing to the body before the rejection arrives.
+             StreamingHttpClient client = newClientBuilder(server, CLIENT_CTX, HTTP_1)
+                     .expectContinueTimeout(ofMinutes(1))
+                     .buildStreaming();
              StreamingHttpConnection conn = client.reserveConnection(client.get("/")).toFuture().get()) {
 
             BufferAllocator alloc = conn.executionContext().bufferAllocator();
@@ -184,7 +187,9 @@ class PayloadSizeLimitingHttpServiceFilterTest {
             assertThat(response.status(), is(PAYLOAD_TOO_LARGE));
             assertThat("body was subscribed", body.isSubscribed(), is(false));
 
-            HttpConnection aggregated = conn.asConnection();
+            conn.onClose().toFuture().get();
+
+            HttpClient aggregated = client.asClient();
             HttpResponse follow = aggregated.request(
                     aggregated.post("/").payloadBody(alloc.fromAscii("ok"))).toFuture().get();
             assertThat(follow.status(), is(OK));

@@ -1,5 +1,5 @@
 /*
- * Copyright © 2018-2020 Apple Inc. and the ServiceTalk project authors
+ * Copyright © 2018-2026 Apple Inc. and the ServiceTalk project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -57,9 +57,9 @@ final class HttpRequestDecoder extends HttpObjectDecoder<HttpRequestMetaData> im
                        final HttpHeadersFactory headersFactory, final int maxStartLineLength,
                        final int maxHeaderFieldLength, final int maxTotalHeaderLength,
                        final boolean allowPrematureClosureBeforePayloadBody, final boolean allowLFWithoutCR,
-                       final CloseHandler closeHandler) {
+                       final boolean allowHeaderWithoutColon, final CloseHandler closeHandler) {
         super(alloc, headersFactory, maxStartLineLength, maxHeaderFieldLength, maxTotalHeaderLength,
-                allowPrematureClosureBeforePayloadBody, allowLFWithoutCR, closeHandler);
+                allowPrematureClosureBeforePayloadBody, allowLFWithoutCR, allowHeaderWithoutColon, closeHandler);
         this.methodQueue = requireNonNull(methodQueue);
         this.closeHandler = closeHandler;
     }
@@ -77,6 +77,11 @@ final class HttpRequestDecoder extends HttpObjectDecoder<HttpRequestMetaData> im
             throw new StacklessDecoderException(
                     "Invalid start-line: must contain only visible characters", cause);
         }
+    }
+
+    @Override
+    protected void onMessageBegin() {
+        // noop
     }
 
     private static void ensureVCHAR(final byte value) {
@@ -154,19 +159,20 @@ final class HttpRequestDecoder extends HttpObjectDecoder<HttpRequestMetaData> im
     }
 
     @Override
-    public void onResponse(final ChannelHandlerContext ctx, final HttpResponseStatus status) {
+    public boolean onResponse(final ChannelHandlerContext ctx, final HttpResponseStatus status) {
         if (expectContinue && !seenPayloadBody) {
             if (status == CONTINUE) {
-                // If server responds with 100 (Continue), no need to trigger resetNow() anymore because server expects
-                // to receive a payload body.
+                // If server responds with 100 (Continue), the client is expected to send the payload body.
                 onStateReset();
             } else if (status.statusClass() != SUCCESSFUL_2XX && status.statusClass() != INFORMATIONAL_1XX) {
-                // If a request expects continuation, but server responds with an error or redirect before it sees a
-                // request payload body, notify CloseHandler and reset the state to prepare for receiving a new request
-                // on the same connection.
+                // The client may still send the declared body at any time and HTTP/1.1 can not skip it, so never resume
+                // parsing requests here (https://tools.ietf.org/html/rfc9110#section-10.1.1). Close after the response
+                // (https://tools.ietf.org/html/rfc9112#section-9.3): the CloseHandler discards inbound data until the
+                // client closes its side.
                 closeHandler.protocolPayloadEndInbound(ctx);
-                resetNow();
+                return true;
             }
         }
+        return false;
     }
 }

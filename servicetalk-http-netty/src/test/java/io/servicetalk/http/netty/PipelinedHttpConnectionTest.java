@@ -1,5 +1,5 @@
 /*
- * Copyright © 2018, 2021 Apple Inc. and the ServiceTalk project authors
+ * Copyright © 2018-2026 Apple Inc. and the ServiceTalk project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 package io.servicetalk.http.netty;
 
 import io.servicetalk.buffer.api.Buffer;
+import io.servicetalk.concurrent.Cancellable;
 import io.servicetalk.concurrent.api.Publisher;
 import io.servicetalk.concurrent.api.Single;
 import io.servicetalk.concurrent.api.TestPublisher;
@@ -25,15 +26,21 @@ import io.servicetalk.http.api.DefaultStreamingHttpRequestResponseFactory;
 import io.servicetalk.http.api.ExecutionContextToHttpExecutionContext;
 import io.servicetalk.http.api.HttpHeaders;
 import io.servicetalk.http.api.StreamingHttpConnection;
+import io.servicetalk.http.api.StreamingHttpRequest;
 import io.servicetalk.http.api.StreamingHttpRequestResponseFactory;
 import io.servicetalk.http.api.StreamingHttpResponse;
 import io.servicetalk.http.api.TestStreamingHttpConnection;
 import io.servicetalk.transport.api.ExecutionContext;
 import io.servicetalk.transport.netty.internal.ExecutionContextExtension;
+import io.servicetalk.transport.netty.internal.FlushStrategy;
 import io.servicetalk.transport.netty.internal.NettyConnection;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+
+import java.util.function.Supplier;
 
 import static io.servicetalk.buffer.netty.BufferAllocators.DEFAULT_ALLOCATOR;
 import static io.servicetalk.concurrent.Cancellable.IGNORE_CANCEL;
@@ -41,6 +48,8 @@ import static io.servicetalk.concurrent.api.Completable.completed;
 import static io.servicetalk.concurrent.api.Completable.never;
 import static io.servicetalk.concurrent.api.SourceAdapters.toSource;
 import static io.servicetalk.http.api.HttpExecutionStrategies.defaultStrategy;
+import static io.servicetalk.http.api.HttpHeaderNames.EXPECT;
+import static io.servicetalk.http.api.HttpHeaderValues.CONTINUE;
 import static io.servicetalk.http.api.HttpProtocolVersion.HTTP_1_1;
 import static io.servicetalk.http.netty.HttpProtocolConfigs.h1;
 import static io.servicetalk.transport.netty.internal.ExecutionContextExtension.immediate;
@@ -49,6 +58,8 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class PipelinedHttpConnectionTest {
@@ -74,6 +85,7 @@ class PipelinedHttpConnectionTest {
     private final StreamingHttpResponse mockResp = reqRespFactory.ok();
 
     private StreamingHttpConnection pipe;
+    private boolean expectContinueNoWait;
 
     private void commonSetup(NettyConnection<Object, Object> connection) {
         when(connection.onClose()).thenReturn(never());
@@ -85,7 +97,7 @@ class PipelinedHttpConnectionTest {
 
         pipe = TestStreamingHttpConnection.from(
                 new PipelinedStreamingHttpConnection(connection, h1().maxPipelinedRequests(2).build(),
-                        reqRespFactory, false, AggregatedPayloadSizeLimiter.NONE));
+                        reqRespFactory, false, AggregatedPayloadSizeLimiter.NONE, expectContinueNoWait));
     }
 
     private void fullSetup(NettyConnection<Object, Object> connection) {
@@ -96,6 +108,7 @@ class PipelinedHttpConnectionTest {
         });
         when(connection.write(any(), any(), any())).then(inv -> {
             Publisher<Object> publisher = inv.getArgument(0);
+            inv.<Supplier<FlushStrategy>>getArgument(1).get(); // the strategy is resolved when the write starts
             return publisher.ignoreElements(); // simulate write consuming all
         });
         when(connection.read()).thenReturn(readPublisher1, readPublisher2);
@@ -111,6 +124,36 @@ class PipelinedHttpConnectionTest {
         Single<StreamingHttpResponse> request = pipe.request(reqRespFactory.get("/Foo"));
         toSource(request).subscribe(dataSubscriber1);
         assertNotNull(dataSubscriber1.awaitOnSuccess());
+    }
+
+    @ParameterizedTest(name = "{displayName} [{index}] expectContinueNoWait={0} expectHeader={1} flushOnEnd={2}")
+    @CsvSource({"true,true,true", "false,true,false", "false,false,true", "true,false,true"})
+    void aggregatedRequestFlushStrategy(boolean noWait, boolean expectHeader, boolean flushOnEnd) {
+        expectContinueNoWait = noWait;
+        fullSetup(connection);
+        StreamingHttpRequest request = reqRespFactory.post("/foo");
+        if (expectHeader) {
+            request.setHeader(EXPECT, CONTINUE);
+        }
+        toSource(pipe.request(request)).subscribe(dataSubscriber1);
+
+        verify(connection, times(flushOnEnd ? 1 : 0)).updateFlushStrategy(any());
+    }
+
+    @Test
+    void aggregatedRequestOverridesFlushStrategyOnlyWhileItsWriteIsActive() {
+        fullSetup(connection);
+        Cancellable resetFlushStrategy = mock(Cancellable.class);
+        when(connection.updateFlushStrategy(any())).thenReturn(resetFlushStrategy);
+
+        // The first request keeps writing, so the aggregated request is queued.
+        toSource(pipe.request(reqRespFactory.post("/foo").payloadBody(writePublisher1))).subscribe(dataSubscriber1);
+        toSource(pipe.request(reqRespFactory.post("/bar"))).subscribe(dataSubscriber2);
+        verify(connection, times(0)).updateFlushStrategy(any());
+
+        writePublisher1.onComplete();
+        verify(connection).updateFlushStrategy(any());
+        verify(resetFlushStrategy).cancel();
     }
 
     @Test
