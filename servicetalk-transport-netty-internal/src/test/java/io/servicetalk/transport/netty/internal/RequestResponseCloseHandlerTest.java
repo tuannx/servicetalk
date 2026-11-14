@@ -44,6 +44,7 @@ import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.SocketChannelConfig;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.util.concurrent.EventExecutor;
+import io.netty.util.concurrent.ScheduledFuture;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
@@ -60,14 +61,15 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.net.InetSocketAddress;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import javax.annotation.Nullable;
 
@@ -87,6 +89,7 @@ import static io.servicetalk.transport.netty.internal.CloseHandler.CloseEvent.PR
 import static io.servicetalk.transport.netty.internal.CloseHandler.forPipelinedRequestResponse;
 import static io.servicetalk.transport.netty.internal.EventLoopAwareNettyIoExecutors.toEventLoopAwareNettyIoExecutor;
 import static io.servicetalk.transport.netty.internal.NettyIoExecutors.createIoExecutor;
+import static io.servicetalk.transport.netty.internal.RequestResponseCloseHandler.GRACEFUL_CLOSE_TIMEOUT_MS;
 import static io.servicetalk.transport.netty.internal.RequestResponseCloseHandlerTest.ScenarioEvents.CI;
 import static io.servicetalk.transport.netty.internal.RequestResponseCloseHandlerTest.ScenarioEvents.FC;
 import static io.servicetalk.transport.netty.internal.RequestResponseCloseHandlerTest.ScenarioEvents.IB;
@@ -114,9 +117,9 @@ import static java.lang.Boolean.TRUE;
 import static java.lang.Integer.toHexString;
 import static java.util.Arrays.asList;
 import static java.util.Objects.hash;
-import static java.util.concurrent.TimeUnit.SECONDS;
 import static java.util.stream.Collectors.toSet;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.is;
@@ -126,6 +129,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
@@ -607,34 +611,29 @@ class RequestResponseCloseHandlerTest {
     }
 
     /**
-     * Reproduces the hang behind <a href="https://github.com/apple/servicetalk/issues/1915">#1915</a> at the
-     * class level. After a server graceful close (response carries {@code Connection: close}),
-     * {@link RequestResponseCloseHandler} half-closes the outbound side and defers the final
-     * {@code channel.close()} until the transport delivers {@code ChannelInputShutdownReadComplete}, which
-     * {@code DefaultNettyConnection} dispatches as {@code channelClosedInbound}. If that single event never
-     * arrives, nothing else completes the close and the channel is stranded open forever, even when the peer
-     * already signalled the end of its input with a TLS {@code close_notify}.
+     * Covers the hang behind <a href="https://github.com/apple/servicetalk/issues/1915">#1915</a>. After a server
+     * graceful close (response carries {@code Connection: close}), {@link RequestResponseCloseHandler} half-closes
+     * the outbound side and waits for the peer's FIN before the final {@code channel.close()}. The FIN arrives as
+     * {@code ChannelInputShutdownReadComplete}, which {@code DefaultNettyConnection} dispatches as
+     * {@code channelClosedInbound}. If that event never arrives, a timeout must close the channel instead of leaving
+     * it open forever.
      */
     @Nested
-    class ServerGracefulCloseMissingReadCompleteTest {
+    class ServerGracefulCloseTimeoutTest {
 
         // Mirrors the private state flags of RequestResponseCloseHandler: DISCARDING_SERVER_INPUT (0x04) |
-        // CLOSING_SERVER_GRACEFULLY (0x08) | OUT_CLOSED (0x20). This is the state the handler is frozen in
-        // when the only event that can complete a server graceful close never arrives; the CI thread dumps
-        // captured for #1915 show the server side stuck in exactly this state (0x2c).
+        // CLOSING_SERVER_GRACEFULLY (0x08) | OUT_CLOSED (0x20). The server stays in this state while it waits for
+        // the peer's FIN; the CI thread dumps captured for #1915 show the server stuck in it (0x2c).
         private static final int STATE_WAITING_FOR_PEER_FIN = 0x04 | 0x08 | 0x20;
 
-        // Every signal in this harness is delivered synchronously on the test thread, so a correct
-        // implementation completes the close while the last signal is processed. The bound only tolerates an
-        // implementation that dispatches the close asynchronously; it is not a timing guess, and it keeps the
-        // failure fast instead of surfacing as a global test timeout the way #1915 does in CI.
-        private static final long CLOSE_COMPLETION_TIMEOUT_SECONDS = 5L;
-
+        private final List<Runnable> scheduledTasks = new ArrayList<>();
+        private final List<Long> scheduledDelaysMs = new ArrayList<>();
+        private final List<CloseEvent> observedEvents = new ArrayList<>();
         private ChannelHandlerContext ctx;
         private SocketChannel channel;
+        private ScheduledFuture<?> timeoutFuture;
         private RequestResponseCloseHandler h;
-        private final CountDownLatch channelClosed = new CountDownLatch(1);
-        private final List<CloseEvent> observedEvents = new CopyOnWriteArrayList<>();
+        private int closeCount;
 
         @BeforeEach
         void setUp() {
@@ -651,6 +650,13 @@ class RequestResponseCloseHandlerTest {
             EventLoop loop = mock(EventLoop.class);
             when(channel.eventLoop()).thenReturn(loop);
             when(loop.inEventLoop()).thenReturn(true);
+            timeoutFuture = mock(ScheduledFuture.class);
+            when(loop.schedule(any(Runnable.class), anyLong(), any(TimeUnit.class))).then(invocation -> {
+                scheduledTasks.add(invocation.getArgument(0));
+                final TimeUnit unit = invocation.getArgument(2);
+                scheduledDelaysMs.add(unit.toMillis((Long) invocation.getArgument(1)));
+                return timeoutFuture;
+            });
             when(scc.getOption(ALLOW_HALF_CLOSURE)).thenReturn(TRUE);
             ChannelPipeline pipeline = mock(ChannelPipeline.class);
             when(pipeline.iterator()).thenReturn(Collections.emptyIterator());
@@ -658,7 +664,7 @@ class RequestResponseCloseHandlerTest {
             when(channel.pipeline()).thenReturn(pipeline);
             ChannelFuture future = mock(ChannelFuture.class);
             when(channel.close()).then(__ -> {
-                channelClosed.countDown();
+                ++closeCount;
                 return future;
             });
             when(channel.shutdownOutput()).then(__ -> {
@@ -672,31 +678,37 @@ class RequestResponseCloseHandlerTest {
         }
 
         @Test
-        void serverGracefulCloseReadCompleteEventArrivesClosesChannel() throws Exception {
+        void serverGracefulCloseReadCompleteEventClosesChannelAndCancelsTimeout() {
             driveServerIntoGracefulClose();
-            // Happy path (control): the peer's FIN is delivered as ChannelInputShutdownReadComplete, which
+            // Happy path: the peer's FIN is delivered as ChannelInputShutdownReadComplete, which
             // DefaultNettyConnection dispatches as channelClosedInbound:
             h.channelClosedInbound(ctx);
-            assertChannelClosed();
+            assertChannelClosedOnce();
+            verify(timeoutFuture).cancel(false);
+            // A timeout that already started running when it was cancelled must not close the channel again:
+            scheduledTasks.get(0).run();
+            assertChannelClosedOnce();
         }
 
         @Test
-        void serverGracefulClosePeerCloseNotifyWithoutReadCompleteClosesChannel() throws Exception {
+        void serverGracefulCloseLostReadCompleteEventClosesChannelAfterTimeout() {
             driveServerIntoGracefulClose();
-            // The peer ended its input and proved it with a TLS close_notify, which DefaultNettyConnection
-            // dispatches as channelCloseNotify. The handler deliberately ignores it while gracefully closing
-            // and keeps waiting for ChannelInputShutdownReadComplete, which the transport never delivers, so
-            // the channel is never closed (#1915):
+            // ChannelInputShutdownReadComplete never arrives (#1915), so only the timeout can close the channel:
+            assertThat("Channel closed before the timeout", closeCount, is(0));
+            scheduledTasks.get(0).run();
+            assertChannelClosedOnce();
+        }
+
+        @Test
+        void serverGracefulClosePeerCloseNotifyDoesNotCloseChannelBeforeTimeout() {
+            driveServerIntoGracefulClose();
+            // With TLS 1.2 and earlier, the SSLEngine treats its own closeOutbound() as a full close, so
+            // channelCloseNotify can follow our own close_notify rather than the peer's. It does not prove that the
+            // peer finished, and closing now could reset the connection before the peer reads the response.
             h.channelCloseNotify(ctx);
-            assertChannelClosed();
-        }
-
-        @Test
-        void serverGracefulCloseLostReadCompleteEventClosesChannel() throws Exception {
-            driveServerIntoGracefulClose();
-            // No further signal arrives at all: the single event that can complete the graceful close,
-            // ChannelInputShutdownReadComplete, is lost at the transport (#1915):
-            assertChannelClosed();
+            assertThat("Channel closed on close_notify before the peer's FIN", closeCount, is(0));
+            scheduledTasks.get(0).run();
+            assertChannelClosedOnce();
         }
 
         private void driveServerIntoGracefulClose() {
@@ -707,17 +719,17 @@ class RequestResponseCloseHandlerTest {
             ChannelPromise promise = ctx.newPromise();
             promise.trySuccess();
             h.protocolPayloadEndOutbound(ctx, promise); // response fully written => serverCloseGracefully()
-            assertThat("Handler did not reach the graceful-close state it gets stuck in for #1915",
+            assertThat("Handler did not reach the state that waits for the peer's FIN",
                     h.state(), is(STATE_WAITING_FOR_PEER_FIN));
             assertThat("Unexpected pending count", h.pending(), is(0));
-            assertThat("Channel closed before the peer finished", channelClosed.getCount(), is(1L));
+            assertThat("Channel closed before the peer finished", closeCount, is(0));
+            assertThat("Graceful close timeouts scheduled (ms)", scheduledDelaysMs,
+                    contains(GRACEFUL_CLOSE_TIMEOUT_MS));
         }
 
-        private void assertChannelClosed() throws Exception {
-            assertThat("Channel was not closed, the graceful close never completed (handler state: 0x" +
-                            toHexString(h.state()) + ", pending: " + h.pending() + ", events: " +
-                            observedEvents + ')',
-                    channelClosed.await(CLOSE_COMPLETION_TIMEOUT_SECONDS, SECONDS), is(true));
+        private void assertChannelClosedOnce() {
+            assertThat("Channel close count (handler state: 0x" + toHexString(h.state()) + ", pending: " +
+                    h.pending() + ", events: " + observedEvents + ')', closeCount, is(1));
         }
     }
 
