@@ -1,5 +1,5 @@
 /*
- * Copyright © 2020-2021 Apple Inc. and the ServiceTalk project authors
+ * Copyright © 2020-2026 Apple Inc. and the ServiceTalk project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,8 +21,11 @@ import io.servicetalk.context.api.ContextMap;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.function.UnaryOperator;
 import javax.annotation.Nullable;
@@ -37,9 +40,11 @@ import static java.time.Duration.ofMillis;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.function.UnaryOperator.identity;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.nullValue;
+import static org.hamcrest.Matchers.sameInstance;
 import static org.hamcrest.Matchers.startsWith;
 
 class PublisherBufferConcurrencyTest {
@@ -142,6 +147,146 @@ class PublisherBufferConcurrencyTest {
         subscriber.awaitOnComplete();
     }
 
+    @ParameterizedTest(name = "{displayName} [{index}]: fail={0}")
+    @ValueSource(booleans = {false, true})
+    void terminalDuringBoundaryDeliveryIsSignaledAfterDeliveryReturns(boolean fail) throws Exception {
+        final TestPublisher<Integer> original = new TestPublisher<>();
+        final TestPublisher<Accumulator<Integer, Integer>> boundaries = new TestPublisher<>();
+        final TestPublisherSubscriber<Integer> subscriber = new TestPublisherSubscriber<>();
+        final CountDownLatch deliveryStarted = new CountDownLatch(1);
+        final CountDownLatch releaseDelivery = new CountDownLatch(1);
+        final CountDownLatch boundaryReturned = new CountDownLatch(1);
+        final AtomicBoolean firstDelivery = new AtomicBoolean(true);
+        toSource(original.buffer(strategyOf(boundaries)).beforeOnNext(__ -> {
+            if (firstDelivery.getAndSet(false)) {
+                deliveryStarted.countDown();
+                await(releaseDelivery);
+            }
+        })).subscribe(subscriber);
+        subscriber.awaitSubscription().request(Long.MAX_VALUE);
+        boundaries.onNext(new SummingAccumulator());
+        original.onNext(1);
+
+        // The next boundary closes the first buffer, and its delivery blocks inside onNext.
+        EXEC.executor().submit(() -> boundaries.onNext(new SummingAccumulator()))
+                .beforeFinally(boundaryReturned::countDown).subscribe();
+        await(deliveryStarted);
+        original.onNext(2);
+        terminate(original, fail);
+        releaseDelivery.countDown();
+        await(boundaryReturned);
+
+        // Every thread that signals is done, nothing is pending: assert the order that was actually observed.
+        assertThat(subscriber.pollAllOnNext(), contains(1, 2));
+        assertTerminal(subscriber, fail);
+    }
+
+    @ParameterizedTest(name = "{displayName} [{index}]: fail={0}")
+    @ValueSource(booleans = {false, true})
+    void terminalDuringBoundaryFinishIsSignaledAfterBufferIsDelivered(boolean fail) throws Exception {
+        final TestPublisher<Integer> original = new TestPublisher<>();
+        final TestPublisher<Accumulator<Integer, Integer>> boundaries = new TestPublisher<>();
+        final TestPublisherSubscriber<Integer> subscriber = new TestPublisherSubscriber<>();
+        final CountDownLatch finishStarted = new CountDownLatch(1);
+        final CountDownLatch releaseFinish = new CountDownLatch(1);
+        final CountDownLatch boundaryReturned = new CountDownLatch(1);
+        toSource(original.buffer(strategyOf(boundaries))).subscribe(subscriber);
+        subscriber.awaitSubscription().request(Long.MAX_VALUE);
+        boundaries.onNext(new SummingAccumulator() {
+            @Override
+            public Integer finish() {
+                finishStarted.countDown();
+                await(releaseFinish);
+                return super.finish();
+            }
+        });
+        original.onNext(1);
+
+        // The next boundary closes the first buffer, and the thread that emits it is blocked in finish().
+        EXEC.executor().submit(() -> boundaries.onNext(new SummingAccumulator()))
+                .beforeFinally(boundaryReturned::countDown).subscribe();
+        await(finishStarted);
+        original.onNext(2);
+        terminate(original, fail);
+        releaseFinish.countDown();
+        await(boundaryReturned);
+
+        // Every thread that signals is done, nothing is pending: assert the order that was actually observed.
+        assertThat(subscriber.pollAllOnNext(), contains(1, 2));
+        assertTerminal(subscriber, fail);
+    }
+
+    @ParameterizedTest(name = "{displayName} [{index}]: fail={0}")
+    @ValueSource(booleans = {false, true})
+    void terminalWithoutNewItemsDuringBoundaryDeliveryIsSignaledAfterDeliveryReturns(boolean fail) throws Exception {
+        final TestPublisher<Integer> original = new TestPublisher<>();
+        final TestPublisher<Accumulator<Integer, Integer>> boundaries = new TestPublisher<>();
+        final TestPublisherSubscriber<Integer> subscriber = new TestPublisherSubscriber<>();
+        final CountDownLatch deliveryStarted = new CountDownLatch(1);
+        final CountDownLatch releaseDelivery = new CountDownLatch(1);
+        final CountDownLatch boundaryReturned = new CountDownLatch(1);
+        final AtomicBoolean firstDelivery = new AtomicBoolean(true);
+        toSource(original.buffer(strategyOf(boundaries)).beforeOnNext(__ -> {
+            if (firstDelivery.getAndSet(false)) {
+                deliveryStarted.countDown();
+                await(releaseDelivery);
+            }
+        })).subscribe(subscriber);
+        subscriber.awaitSubscription().request(Long.MAX_VALUE);
+        boundaries.onNext(new SummingAccumulator());
+        original.onNext(1);
+
+        EXEC.executor().submit(() -> boundaries.onNext(new SummingAccumulator()))
+                .beforeFinally(boundaryReturned::countDown).subscribe();
+        await(deliveryStarted);
+        terminate(original, fail);
+        releaseDelivery.countDown();
+        await(boundaryReturned);
+
+        assertThat(subscriber.pollAllOnNext(), contains(1));
+        assertTerminal(subscriber, fail);
+    }
+
+    private static BufferStrategy<Integer, Accumulator<Integer, Integer>, Integer> strategyOf(
+            final Publisher<Accumulator<Integer, Integer>> boundaries) {
+        return new BufferStrategy<Integer, Accumulator<Integer, Integer>, Integer>() {
+            @Override
+            public Publisher<Accumulator<Integer, Integer>> boundaries() {
+                return boundaries;
+            }
+
+            @Override
+            public int bufferSizeHint() {
+                return 8;
+            }
+        };
+    }
+
+    private static void terminate(final TestPublisher<Integer> original, final boolean fail) {
+        if (fail) {
+            original.onError(DELIBERATE_EXCEPTION);
+        } else {
+            original.onComplete();
+        }
+    }
+
+    private static void assertTerminal(final TestPublisherSubscriber<Integer> subscriber, final boolean fail) {
+        if (fail) {
+            assertThat(subscriber.awaitOnError(), is(sameInstance(DELIBERATE_EXCEPTION)));
+        } else {
+            subscriber.awaitOnComplete();
+        }
+    }
+
+    private static void await(final CountDownLatch latch) {
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throwException(e);
+        }
+    }
+
     private void runTest(final UnaryOperator<Publisher<Integer>> beforeBuffer,
                          final UnaryOperator<Publisher<Iterable<Integer>>> afterBuffer) throws Exception {
         final int maxRange = 1000;
@@ -170,7 +315,7 @@ class PublisherBufferConcurrencyTest {
                 .get();
     }
 
-    private static final class SummingAccumulator implements Accumulator<Integer, Integer> {
+    private static class SummingAccumulator implements Accumulator<Integer, Integer> {
         private int sum;
 
         @Override
