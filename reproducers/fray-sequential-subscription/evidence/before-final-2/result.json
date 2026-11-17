@@ -1,0 +1,28 @@
+{
+  "revision": "a0106c7cc09968ed8bce3b4b02a74057bbec4544",
+  "subjectSha256": "a338493ad7788e0fb9414d5750be1be3a89663ba1a236b72bab2bcc4ff0b4f75",
+  "testSha256": "8c2ba4c08f461e41e16b389b3a1ad3d84873e9bd26a833053a71a069724c6b47",
+  "frayVersion": "0.9.0",
+  "javaVersion": "openjdk version \"25.0.1\" 2025-10-21 LTS\nOpenJDK Runtime Environment Corretto-25.0.1.8.1 (build 25.0.1+8-LTS)\nOpenJDK 64-Bit Server VM Corretto-25.0.1.8.1 (build 25.0.1+8-LTS, mixed mode, sharing)",
+  "mode": "replay",
+  "requestedIterations": 1,
+  "reportedTotalIter": 0,
+  "lastProgressIteration": null,
+  "errorIteration": 0,
+  "exitCode": 1,
+  "junit": {
+    "tests": 1,
+    "failures": 1,
+    "errors": 0,
+    "skipped": 0
+  },
+  "failures": [
+    "java.lang.AssertionError: \nExpected: is <2L>\n     but: was <0L>"
+  ],
+  "replayInputSha256": {
+    "random.json": "3b33a4bd222dc7aaf395da138bca6cb823dd5b96899682569bd134fcb155adeb",
+    "scheduler": "6e5e5148e773bb0b25f29e6b0fc1495683986b35f1510be06e5f5e790ef635dc",
+    "timeline_coverage.txt": "133cc255f5c8480a3f4fc9f45613378025207dbc77c8af433dba21daeda39208"
+  },
+  "wallSeconds": 2.36560325
+}

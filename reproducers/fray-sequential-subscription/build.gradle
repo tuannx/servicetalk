@@ -1,0 +1,55 @@
+/*
+ * Copyright © 2026 Apple Inc. and the ServiceTalk project authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+plugins {
+    id 'java'
+    id 'checkstyle'
+    id 'org.pastalab.fray.gradle' version '0.9.0'
+}
+repositories { mavenCentral() }
+java { toolchain { languageVersion = JavaLanguageVersion.of(25) } }
+fray { jdkPath = System.getenv('JAVA_HOME') }
+dependencies {
+    implementation 'io.servicetalk:servicetalk-concurrent-api:0.42.67'
+    implementation 'io.servicetalk:servicetalk-concurrent-internal:0.42.67'
+    implementation 'io.servicetalk:servicetalk-utils-internal:0.42.67'
+    compileOnly 'com.google.code.findbugs:jsr305:3.0.2'
+    testImplementation platform('org.junit:junit-bom:5.10.2')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testImplementation 'org.hamcrest:hamcrest:2.2'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+sourceSets.main.java.srcDirs = ['build/subject']
+tasks.withType(Test).configureEach {
+    useJUnitPlatform()
+    outputs.upToDateWhen { false }
+    testLogging { events 'failed'; showStandardStreams = true }
+}
+
+tasks.named('compileJava') { options.release = 8 }
+
+sourceSets.test.java.srcDirs = ['build/generated/src/test/java']
+dependencyLocking { lockAllConfigurations() }
+checkstyle {
+    toolVersion = '9.2'
+    configDirectory = file('../../servicetalk-gradle-plugin-internal/src/main/resources/' +
+            'io/servicetalk/gradle/plugin/internal/checkstyle')
+}
+tasks.register('quality') { dependsOn 'checkstyleTest' }
+tasks.register('writeRuntimeClasspath') {
+    doLast {
+        file('build/runtime-classpath.txt').text = sourceSets.test.runtimeClasspath.asPath
+    }
+}

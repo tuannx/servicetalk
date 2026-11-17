@@ -1,0 +1,57 @@
+= SequentialSubscription Fray regression
+
+Standalone follow-up for https://github.com/apple/servicetalk/pull/3677[#3677].
+The source emits one item, requests two more, and signals termination before its
+initial `switchTo` returns. Another thread switches to the replacement after
+that signal. After both threads finish, the replacement must have received
+demand for exactly two items. The assertion detects both missing and duplicated demand.
+
+== Run
+
+Requires Python 3, JDK 25 (`JAVA_HOME`), and the repository's Gradle wrapper
+(9.8.1 at the recorded base). Fray is pinned to 0.9.0; dependencies are locked.
+Run from the repository root, one invocation at a time, with a fresh output label:
+
+[source,shell]
+----
+# macOS example; on other systems set JAVA_HOME to your JDK 25 installation.
+export JAVA_HOME=$(/usr/libexec/java_home -v 25)
+
+# Expected exit 1: replay the recorded failure on the immediate pre-fix parent.
+python3 reproducers/fray-sequential-subscription/run.py a0106c7cc09968ed8bce3b4b02a74057bbec4544 before --replay
+
+# Expected exit 0: explore 10,000 iterations on the recorded main revision.
+python3 reproducers/fray-sequential-subscription/run.py a1bd0993b89ca66981b8ca364de23aa9ee387bcc after
+
+./gradlew -p reproducers/fray-sequential-subscription quality
+----
+
+Omit `--replay` on the pre-fix revision to discover a new failing schedule.
+Discovery is randomized: the failing iteration is not expected to be constant.
+`evidence/recording` contains the recorded random choices and scheduler, not a
+numeric seed. Replay was validated on macOS arm64 with Corretto 25.0.1.8.1.
+Other platforms/JDKs have not been verified.
+
+The runner extracts only `SequentialSubscription.java` from the specified Git
+commit and compiles it with Java 8 bytecode. Supporting ServiceTalk classes use
+the locked 0.42.67 artifacts. This is an isolated class reproducer, not a full
+build or CI run of either revision. It is separate from the repository build.
+
+== Measured on 2026-10-29
+
+* Discovery on `a0106c7`: Fray reported `iter: 63`, expected `2`, actual `0`.
+  This is a fresh reproduction, not the previously reported iteration 24.
+* Two replays on that revision reproduced the same assertion and identical
+  normalized result hashes. `wallSeconds` is excluded from normalization.
+* Main `a1bd0993`: 10,000 iterations, no assertion failures or deadlocks reported.
+* Test Checkstyle: passed using the repository's Checkstyle 9.2 configuration.
+
+See `evidence/` for results and Fray logs (trailing whitespace trimmed). The discovery log predates formatting
+of the test; the two replay results and main result correspond to the committed
+test body. Replay substitutes only the annotation to select the recording.
+Generated sources, complete Gradle logs, JUnit XML, and fresh recordings are
+retained under `build/runs/<label>/`. A `result.json` is an observation, not a
+red-team gate verdict; check the exit code and JUnit counts before interpreting it.
+
+This confirms one regression covered by the merged fix. It does not prove that
+all interleavings are safe or establish the end-to-end cause of issue #1672.
