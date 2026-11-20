@@ -1,5 +1,5 @@
 /*
- * Copyright © 2020-2021 Apple Inc. and the ServiceTalk project authors
+ * Copyright © 2020-2026 Apple Inc. and the ServiceTalk project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -251,6 +251,8 @@ final class PublisherBuffer<T, B> extends AbstractAsynchronousPublisherOperator<
          *     <li>{@link #ADDING} if an item is being added to the currently active {@link Accumulator}.</li>
          *     <li>{@link NextAccumulatorHolder} if the next boundary is received while still {@link #ADDING} or
          *     finishing current {@link Accumulator}.</li>
+         *     <li>{@link AddingToNext} if an item is being added to the next {@link Accumulator} while the
+         *     previous one is still being delivered to the target.</li>
          *     <li>{@link ItemsTerminated} if the items source terminated but the target is not yet terminated because
          *     we were delivering onNext or because where was not demand.</li>
          *     <li>{@link #TERMINATED} if the target subscriber has been terminated (or cancelled).</li>
@@ -312,17 +314,23 @@ final class PublisherBuffer<T, B> extends AbstractAsynchronousPublisherOperator<
                 // If we are ADDING and maybeAccumulator has changed then either it should have terminated or
                 // a new accumulator has been received. If a new accumulator is received, we will finish the current
                 // accumulator and emit the result.
-                if (maybeAccumulatorUpdater.compareAndSet(this, cMaybeAccumulator, ADDING)) {
-                    // Use the next accumulator if the current one is already on the way to the target:
+                // Use the next accumulator if the current one is already on the way to the target. In that case keep
+                // the holder visible after adding, so that `itemsTerminated` still defers to the delivering thread.
+                @SuppressWarnings("unchecked")
+                final NextAccumulatorHolder<T, B> deliveringHolder =
+                        NextAccumulatorHolder.class.equals(cMaybeAccumulator.getClass()) ?
+                                (NextAccumulatorHolder<T, B>) cMaybeAccumulator : null;
+                final Object addingState = deliveringHolder == null ? ADDING : deliveringHolder.adding;
+                if (maybeAccumulatorUpdater.compareAndSet(this, cMaybeAccumulator, addingState)) {
                     @SuppressWarnings("unchecked")
-                    final Accumulator<T, B> accumulator =
-                            NextAccumulatorHolder.class.equals(cMaybeAccumulator.getClass()) ?
-                                    ((NextAccumulatorHolder<T, B>) cMaybeAccumulator).accumulator :
-                                    (Accumulator<T, B>) cMaybeAccumulator;
+                    final Accumulator<T, B> accumulator = deliveringHolder == null ?
+                            (Accumulator<T, B>) cMaybeAccumulator : deliveringHolder.accumulator;
                     accumulator.accumulate(item);
-                    final Object nextState = maybeAccumulatorUpdater.accumulateAndGet(this, accumulator,
-                            (prev, next) -> prev == ADDING ? next : prev);
-                    if (nextState == accumulator || nextState == TERMINATED) {
+                    final Object afterAdding = deliveringHolder == null ? accumulator : deliveringHolder;
+                    // ADDING after adding to the holder's accumulator means the delivering thread is done.
+                    final Object nextState = maybeAccumulatorUpdater.updateAndGet(this,
+                            prev -> prev == addingState ? afterAdding : prev == ADDING ? accumulator : prev);
+                    if (nextState == afterAdding || nextState == accumulator || nextState == TERMINATED) {
                         return;
                     }
                     // Received the next boundary while adding, deliver current accumulator and unwrap the next boundary
@@ -366,9 +374,10 @@ final class PublisherBuffer<T, B> extends AbstractAsynchronousPublisherOperator<
                         // Thread that is ADDING will observe the change and emit the current accumulator
                         return;
                     }
-                } else if (NextAccumulatorHolder.class.equals(cMaybeAccumulator.getClass())) {
+                } else if (NextAccumulatorHolder.class.equals(cMaybeAccumulator.getClass()) ||
+                        AddingToNext.class.equals(cMaybeAccumulator.getClass())) {
                     // One more boundary is received when we already have a "queued" next boundary (we are in ADDING
-                    // state or delivering the previous boundary), discarding it.
+                    // state or delivering the previous boundary, maybe while adding to the queued one), discarding it.
                     // Since we did not emit the accumulator we request one more to observe the next boundary:
                     bSubscription.request(1);
                     return;
@@ -398,15 +407,18 @@ final class PublisherBuffer<T, B> extends AbstractAsynchronousPublisherOperator<
         <T, B> Object unwrapHolderState(final NextAccumulatorHolder<T, B> holder) {
             return maybeAccumulatorUpdater.accumulateAndGet(this,
                     // Keep "prev" state because we observed `itemsTerminated` or `accumulate` took
-                    // ownership of the `holder`
-                    holder.accumulator, (prev, next) -> prev == holder ? next : prev);
+                    // ownership of the `holder`. If `accumulate` is adding to the holder's accumulator, it now
+                    // owns the accumulator as if it was ADDING to the current one.
+                    holder.accumulator, (prev, next) -> prev == holder ? next : prev == holder.adding ? ADDING : prev);
         }
 
         <T, B> void itemsTerminated(final TerminalNotification terminalNotification,
                                     final Subscriber<? super B> target, final Cancellable bCancellable) {
             for (;;) {
                 final Object cMaybeAccumulator = maybeAccumulator;
-                assert cMaybeAccumulator != ADDING; // `accumulate` and `itemsTerminated` are sequential
+                // `accumulate` and `itemsTerminated` are sequential
+                assert cMaybeAccumulator != ADDING &&
+                        (cMaybeAccumulator == null || !AddingToNext.class.equals(cMaybeAccumulator.getClass()));
                 if (cMaybeAccumulator == TERMINATED) {
                     return;
                 } else if (cMaybeAccumulator != null &&
@@ -504,10 +516,19 @@ final class PublisherBuffer<T, B> extends AbstractAsynchronousPublisherOperator<
 
     private static final class NextAccumulatorHolder<T, B> {
         final CountingAccumulator<T, B> accumulator;
+        // State while an item is added to this accumulator before the previous one is delivered.
+        final AddingToNext adding = new AddingToNext();
 
         NextAccumulatorHolder(final Accumulator<T, B> accumulator) {
             this.accumulator = toCounting(accumulator);
         }
+    }
+
+    /**
+     * Marks that an item is being added to {@link NextAccumulatorHolder#accumulator} while the previous
+     * {@link Accumulator} is still being delivered to the target.
+     */
+    private static final class AddingToNext {
     }
 
     private static final class ItemsTerminated<T, B> {
